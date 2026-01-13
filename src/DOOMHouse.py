@@ -1,4 +1,4 @@
-import clickhouse_connect
+import chdb
 import sys
 import array
 import math
@@ -14,10 +14,7 @@ load_dotenv()
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-HOST = os.getenv('CLICKHOUSE_HOST', 'localhost')
-PORT = int(os.getenv('CLICKHOUSE_PORT', '8123'))
-USER = os.getenv('CLICKHOUSE_USER', 'default')
-PASS = os.getenv('CLICKHOUSE_PASS', '')
+# chDB is an in-process database, so we don't need host/port/user/pass
 
 # Movement Constants
 MOVE_SPEED = 0.3
@@ -82,12 +79,20 @@ class DOOMHouse:
         self.root.bind("<KeyRelease>", self._on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Connect to DB
+        # Connect to DB (chDB session)
         try:
-            self.client = clickhouse_connect.get_client(
-                host=HOST, port=PORT, username=USER, password=PASS
-            )
-            self.client.command("CREATE DATABASE IF NOT EXISTS doomhouse")
+            # Using a persistent session for chDB to maintain state across queries
+            self.session = chdb.session.Session()
+            
+            # Tune chDB for real-time performance
+            # 1. Disable asynchronous inserts for immediate processing
+            # 2. Set memory limits and thread counts for low latency
+            self.session.query("SET async_insert = 0")
+            self.session.query("SET wait_for_async_insert = 1")
+            self.session.query("SET max_threads = 8") # Adjust based on CPU
+            self.session.query("SET optimize_move_to_prewhere = 1")
+            
+            self.session.query("CREATE DATABASE IF NOT EXISTS doomhouse")
             self.cleanup_database()
             self.initialize_game_data()
             
@@ -99,7 +104,7 @@ class DOOMHouse:
             self.initialize_texture()
             self.initialize_tables()
         except Exception as e:
-            print(f"Error connecting to ClickHouse: {e}")
+            print(f"Error initializing chDB: {e}")
             sys.exit(1)
 
         # Frame tracking
@@ -225,18 +230,18 @@ class DOOMHouse:
     def _setup_texture_resource(self, table_name, dict_name, texture_file):
         """Helper to create table, dictionary and load texture data."""
         try:
-            self.client.command(f"DROP TABLE IF EXISTS doomhouse.{table_name}")
-            self.client.command(f"""
+            self.session.query(f"DROP TABLE IF EXISTS doomhouse.{table_name}")
+            self.session.query(f"""
                 CREATE TABLE doomhouse.{table_name} (
                     id UInt32,
                     r UInt8,
                     g UInt8,
                     b UInt8
-                ) ENGINE = MergeTree ORDER BY id
+                ) ENGINE = Memory
             """)
             
-            self.client.command(f"DROP DICTIONARY IF EXISTS doomhouse.{dict_name}")
-            self.client.command(f"""
+            self.session.query(f"DROP DICTIONARY IF EXISTS doomhouse.{dict_name}")
+            self.session.query(f"""
                 CREATE DICTIONARY doomhouse.{dict_name} (
                     id UInt32,
                     r UInt8,
@@ -256,20 +261,27 @@ class DOOMHouse:
         
         print(f"💾 Initializing doomhouse.{table_name} table with {len(tex_data)} pixels...")
         try:
-            self.client.command(f"TRUNCATE TABLE doomhouse.{table_name}")
-            data = [
-                [
-                    i + 1,
-                    max(0, min(255, int(r * TEXTURE_INTENSITY))),
-                    max(0, min(255, int(g * TEXTURE_INTENSITY))),
-                    max(0, min(255, int(b * TEXTURE_INTENSITY)))
-                ]
-                for i, (r, g, b) in enumerate(tex_data)
-            ]
-            self.client.insert(f'doomhouse.{table_name}', data)
+            # chDB doesn't have a direct .insert() like clickhouse_connect for lists of lists
+            # We'll use a multi-row INSERT statement
+            self.session.query(f"TRUNCATE TABLE doomhouse.{table_name}")
+            
+            # Batch the insert to avoid extremely long query strings
+            batch_size = 10000
+            for i in range(0, len(tex_data), batch_size):
+                batch = tex_data[i:i+batch_size]
+                values = []
+                for j, (r, g, b) in enumerate(batch):
+                    idx = i + j + 1
+                    rv = max(0, min(255, int(r * TEXTURE_INTENSITY)))
+                    gv = max(0, min(255, int(g * TEXTURE_INTENSITY)))
+                    bv = max(0, min(255, int(b * TEXTURE_INTENSITY)))
+                    values.append(f"({idx},{rv},{gv},{bv})")
+                
+                insert_sql = f"INSERT INTO doomhouse.{table_name} (id, r, g, b) VALUES {','.join(values)}"
+                self.session.query(insert_sql)
             
             print(f"🔄 Reloading dictionary doomhouse.{dict_name}...")
-            self.client.command(f"SYSTEM RELOAD DICTIONARY doomhouse.{dict_name}")
+            self.session.query(f"SYSTEM RELOAD DICTIONARY doomhouse.{dict_name}")
         except Exception as e:
             print(f"Error initializing texture {dict_name}: {e}")
 
@@ -301,8 +313,8 @@ class DOOMHouse:
         print("🧹 Cleaning up existing database objects to avoid dependency errors...")
         try:
             # 1. Drop Materialized Views first
-            self.client.command("DROP VIEW IF EXISTS doomhouse.render_materialized")
-            self.client.command("DROP VIEW IF EXISTS doomhouse.post_process_materialized")
+            self.session.query("DROP VIEW IF EXISTS doomhouse.render_materialized")
+            self.session.query("DROP VIEW IF EXISTS doomhouse.post_process_materialized")
             
             # 2. Drop Dictionaries
             dicts = [
@@ -310,16 +322,16 @@ class DOOMHouse:
                 "dict_tex_wall1_data", "dict_tex_wall2_data", "dict_tex_floor_data", "dict_tex_ceiling_data"
             ]
             for d in dicts:
-                self.client.command(f"DROP DICTIONARY IF EXISTS doomhouse.{d}")
+                self.session.query(f"DROP DICTIONARY IF EXISTS doomhouse.{d}")
                 
             # 3. Drop Tables
             tables = [
                 "map_source", "floor_dist_source", "tex_source", "tex_wall_source",
                 "tex_wall1_source", "tex_wall2_source", "tex_floor_source", "tex_ceiling_source",
-                "player_input", "rendered_frame", "rendered_frame_post_processed"
+                "player_input", "rendered_frame", "rendered_frame_post_processed", "player_input_buffer"
             ]
             for t in tables:
-                self.client.command(f"DROP TABLE IF EXISTS doomhouse.{t}")
+                self.session.query(f"DROP TABLE IF EXISTS doomhouse.{t}")
         except Exception as e:
             print(f"Note: Cleanup encountered an issue: {e}")
 
@@ -391,15 +403,15 @@ class DOOMHouse:
             if name:
                 name = name.split('(')[0].strip()
                 if "DICTIONARY" in upper_stmt:
-                    self.client.command(f"DROP DICTIONARY IF EXISTS {name}")
+                    self.session.query(f"DROP DICTIONARY IF EXISTS {name}")
                 elif "VIEW" in upper_stmt:
-                    self.client.command(f"DROP VIEW IF EXISTS {name}")
+                    self.session.query(f"DROP VIEW IF EXISTS {name}")
                 else:
-                    self.client.command(f"DROP TABLE IF EXISTS {name}")
+                    self.session.query(f"DROP TABLE IF EXISTS {name}")
             
             print(f"💾 Executing statement from {script_path}...")
             try:
-                self.client.command(stmt)
+                self.session.query(stmt)
             except Exception as e:
                 print(f"Error executing statement: {e}")
 
@@ -417,6 +429,7 @@ class DOOMHouse:
             "src/SQL/render_view.sql",
             "src/SQL/post_process_view.sql",
         ]
+        
         
         for sql_file in sql_files:
             self.execute_sql_script(sql_file)
@@ -466,12 +479,14 @@ class DOOMHouse:
         try:
             start_time = time.time()
             self.frame_id += 1
-            self.client.command(f"""
+            # Use the Memory engine table for faster insertion
+            self.session.query(f"""
                 INSERT INTO doomhouse.player_input
-                (frame_id, old_x, old_y, try_x, try_y, dir_x, dir_y, plane_x, plane_y)
+                (frame_id, old_x, old_y, try_x, try_y, dir_x, dir_y, plane_x, plane_y, timestamp)
                 VALUES ({self.frame_id}, {self.pos_x}, {self.pos_y}, {target_x}, {target_y},
-                        {self.dir_x}, {self.dir_y}, {self.plane_x}, {self.plane_y})
-            """)            
+                        {self.dir_x}, {self.dir_y}, {self.plane_x}, {self.plane_y}, now())
+            """)
+            
             self.insert_time = (time.time() - start_time) * 1000 # in ms
             self.total_insert_time += self.insert_time
             self.insert_count += 1
@@ -502,12 +517,10 @@ class DOOMHouse:
         try:
             start_time = time.time()
             
-            # Pull rendered frame from the materialized table
-            #result = self.client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame")            
-            result = self.client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed")
-            if not result.result_rows:
-                return
-
+            # Pull rendered frame from the materialized table using Arrow for zero-copy
+            # result = self.session.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame", "Arrow")
+            result = self.session.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed", "Arrow")
+            
             # Calculate render time
             select_time = (time.time() - start_time) * 1000 # in ms
             self.total_select_time += select_time
@@ -515,19 +528,40 @@ class DOOMHouse:
             avg_select_time = self.total_select_time / self.select_count
             print(f"Select: {select_time:.2f}ms (Avg: {avg_select_time:.2f}ms)")
 
+            # Use PyArrow to read the buffer without copying
+            import pyarrow as pa
+            # chdb result.bytes() for "Arrow" format is a full Arrow IPC stream
+            # Some versions of chdb might return Arrow file format instead of stream
+            try:
+                reader = pa.ipc.open_stream(result.bytes())
+                table = reader.read_all()
+            except:
+                reader = pa.ipc.open_file(result.bytes())
+                table = reader.read_all()
+            
+            if table.num_rows == 0:
+                return
+
             # Set new position (synced from DB)
-            self.pos_x = result.result_rows[0][0]
-            self.pos_y = result.result_rows[0][1]
+            # Arrow columns are accessible by name
+            self.pos_x = table.column('pos_x')[0].as_py()
+            self.pos_y = table.column('pos_y')[0].as_py()
             
             # Get Array(UInt32) and convert to bytes
-            # ClickHouse returns a list of ints for Array(UInt32)
-            pixel_data = result.result_rows[0][2]
+            # In Arrow, Array(UInt32) is represented as a ListArray or FixedSizeListArray
+            # We want the underlying buffer of the first row's list
+            pixel_data_list = table.column('image_data')[0]
             
-            # Convert list of UInt32 to bytes efficiently.
-            # Each UInt32 is [R, G, B, 0] in little-endian memory.
-            # Note: SQL now packs as R (shift 0), G (shift 8), B (shift 16).
-            # In little-endian 'I' (UInt32), this results in [R, G, B, 0] bytes.
-            raw_bytes = array.array('I', pixel_data).tobytes()
+            # Convert Arrow list to numpy/bytes efficiently
+            # values property gives the flattened array of all elements in the column
+            # Since we only have one row, we can just take the values
+            raw_bytes = pixel_data_list.values.to_string_view() if hasattr(pixel_data_list.values, 'to_string_view') else pixel_data_list.values.to_pylist()
+            
+            # More robust way to get bytes from Arrow UInt32 array:
+            # We can use the buffer directly if possible, or convert to numpy then bytes
+            import numpy as np
+            pixel_np = pixel_data_list.values.to_numpy()
+            raw_bytes = pixel_np.tobytes()
             
             # Create image from raw bytes (640x480)
             # "RGBX" means 4 bytes per pixel, where X is the 4th byte (0 in our case).
@@ -547,8 +581,8 @@ class DOOMHouse:
             
             self.root.update_idletasks()
 
-            self.pos_x = result.result_rows[0][0]
-            self.pos_y = result.result_rows[0][1]
+            self.pos_x = table.column('pos_x')[0].as_py()
+            self.pos_y = table.column('pos_y')[0].as_py()
         except Exception as e:
             print(f"Render Error: {e}")
 
