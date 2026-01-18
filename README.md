@@ -7,6 +7,9 @@
 ### DISCLAIMER 
 _**This repository is ~95% generated using Kilo Code with Gemini 3.0 Pro Preview, Gemini 3.0 Flash Preview, Opus 4.5 and ChatGPT 5.2.**_ 
 
+### Blogpost:
+[DOOMHouse: 3D game render engine in pure ClickHouse SQL](https://therewillbedata.substack.com/p/doomhouse-3d-game-render-engine-in)
+
 ### Description
 
 DOOMHouse is an experimental "Doom-like" 3D game rendering engine that offloads all the rendering logic entirely to a ClickHouse database. 
@@ -19,7 +22,7 @@ This project serves multiple purposes:
 The core graphics logic — including collision detection, raycasting, texture mapping, and shading — is executed via SQL queries, while a lightweight Python client handles user input and displays the resulting frames.
 
 ### Screen recording
-[![DoomHouse](images/yt_thumbnail.jpeg)](https://www.youtube.com/watch?v=_yni1K0cqW8)
+[![DoomHouse](images/yt_thumbnail.jpeg)](https://youtu.be/us5Vp_spnP8)
 
 ### Themes
 The engine supports different visual styles through SQL-based rendering logic. Examples:
