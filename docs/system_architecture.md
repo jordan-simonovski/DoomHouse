@@ -37,15 +37,15 @@ graph TD
     subgraph RenderPipeline ["Render Pipeline (x4 Parallel)"]
         direction TB
         
-        RV[render_materialized_N]:::view
-        RF[rendered_frame_N]:::table
-        PPV[post_process_materialized_N]:::view
-        RPP[rendered_frame_post_processed_N]:::table
+        RV["render_materialized_N<br/>(Raycasting, Texture Mapping,<br/>Shading, Pixel Packing)"]:::view
+        RF["rendered_frame_N<br/>(Raw Frame Buffer)"]:::table
+        PPV["post_process_materialized_N<br/>(SWAR Smoothing/Blur)"]:::view
+        RPP["rendered_frame_post_processed_N<br/>(Final Frame Buffer)"]:::table
         
-        InputTable -.-> RV
-        RV --> RF
-        RF -.-> PPV
-        PPV --> RPP
+        InputTable -.->|Trigger| RV
+        RV -->|Populate| RF
+        RF -.->|Trigger| PPV
+        PPV -->|Populate| RPP
     end
 
     %% Dictionary Dependencies
