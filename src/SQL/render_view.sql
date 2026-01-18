@@ -148,7 +148,7 @@ FROM (
         ) AS rays
         CROSS JOIN (
             SELECT number as y, toInt32(H - 1 - number) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
-            FROM numbers(H_QUARTER)
+            FROM numbers(H_QUARTER + 1)
         ) AS v_lines
     ) AS sub
 );
@@ -237,8 +237,8 @@ FROM (
             )
         ) AS rays
         CROSS JOIN (
-            SELECT number + H_QUARTER as y, toInt32(H - 1 - (number + H_QUARTER)) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
-            FROM numbers(H_QUARTER)
+            SELECT number + H_QUARTER - 1 as y, toInt32(H - 1 - (number + H_QUARTER - 1)) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
+            FROM numbers(H_QUARTER + 2)
         ) AS v_lines
     ) AS sub
 );
@@ -327,8 +327,8 @@ FROM (
             )
         ) AS rays
         CROSS JOIN (
-            SELECT number + H_HALF as y, toInt32(number + H_HALF) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
-            FROM numbers(H_QUARTER)
+            SELECT number + H_HALF - 1 as y, toInt32(number + H_HALF - 1) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
+            FROM numbers(H_QUARTER + 2)
         ) AS v_lines
     ) AS sub
 );
@@ -417,8 +417,8 @@ FROM (
             )
         ) AS rays
         CROSS JOIN (
-            SELECT number + H_HALF + H_QUARTER as y, toInt32(number + H_HALF + H_QUARTER) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
-            FROM numbers(H_QUARTER)
+            SELECT number + H_HALF + H_QUARTER - 1 as y, toInt32(number + H_HALF + H_QUARTER - 1) as dist_lookup_idx, dictGet('doomhouse.dict_floor_dist', 'dist', toUInt32(dist_lookup_idx + 1)) as floor_dist
+            FROM numbers(H_QUARTER + 1)
         ) AS v_lines
     ) AS sub
 );

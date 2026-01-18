@@ -589,12 +589,21 @@ class DOOMHouse:
             self.pos_y = result1.result_rows[0][1]
             
             # Compositing Step: Stitch the four partial image buffers
-            pixel_data = (
-                result1.result_rows[0][2] + 
-                result2.result_rows[0][2] + 
-                result3.result_rows[0][2] + 
-                result4.result_rows[0][2]
-            )
+            # We slice the arrays to remove the overlap rows used for seamless post-processing
+            # Q1: 0-120 -> 0-119 (Drop last)
+            # Q2: 119-240 -> 120-239 (Drop first and last)
+            # Q3: 239-360 -> 240-359 (Drop first and last)
+            # Q4: 359-479 -> 360-479 (Drop first)
+            
+            row_size = 640
+            rows_per_q = 120
+            
+            p1 = result1.result_rows[0][2][:rows_per_q * row_size]
+            p2 = result2.result_rows[0][2][row_size : row_size + rows_per_q * row_size]
+            p3 = result3.result_rows[0][2][row_size : row_size + rows_per_q * row_size]
+            p4 = result4.result_rows[0][2][row_size:]
+            
+            pixel_data = p1 + p2 + p3 + p4
             
             # Convert list of UInt32 to bytes efficiently.
             # Each UInt32 is [R, G, B, 0] in little-endian memory.
