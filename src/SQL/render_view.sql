@@ -1,311 +1,182 @@
-/*
-   ========================================================================================
-   DOOMHOUSE RENDER ENGINE: 3D Raycasting in Pure SQL
-   ========================================================================================
-
-   OVERVIEW:
-   This script implements a Wolfenstein 3D-style raycasting engine entirely within a 
-   ClickHouse Materialized View. It transforms player coordinates and a 2D map into 
-   a rendered 3D frame buffer.
-
-   CORE CONCEPTS:
-
-   1. VECTORIZED RAYCASTING (Replacing Loops with Arrays):
-      SQL is declarative and lacks efficient imperative `for` or `while` loops needed 
-      to march a ray step-by-step until it hits a wall.
-      
-      We solve this using High-Order Array Functions:
-      - `range(1, RAY_STEPS)`: Generates an array of indices [1, 2, ... 15].
-      - `arrayMap(func, array)`: Applies the ray trajectory logic to *every* step 
-        simultaneously (vectorization) rather than sequentially.
-      - `arrayMin(array)`: Analyzing the results of the map to find the *first* 
-        step where a wall intersection occurred (Minimum distance).
-
-   2. DICTIONARY TEXTURE MAPPING (Split Channels):
-      Textures and Map data are stored in memory-mapped ClickHouse Dictionaries.
-      To optimize memory access and CPU cycles, texture data is split into separate 
-      `r`, `g`, and `b` (UInt8) columns. This avoids the overhead of bitwise unpacking 
-      a single UInt32 color integer during the shading step.
-
-   3. FISH-EYE CORRECTION:
-      Raw Euclidean distance creates a "fish-eye" lens effect. We correct this by 
-      projecting the ray distance onto the camera plane vector (Dot Product), 
-      ensuring walls appear straight.
-
-   4. LIGHTING & ATMOSPHERE:
-      To create 3D depth, the engine applies two shading techniques:
-      - Distance Fog: Pixel colors are multiplied by a decay factor based on distance. 
-        Everything fades to black at a distance of ~20 units.
-      - Fake Contrast: Walls facing North/South are rendered 40% darker than walls 
-        facing East/West. This visually separates corners without needing real light sources.
-
-   5. COLLISION DETECTION (Slide-and-Collide):
-      Movement logic includes a collision check against the map dictionary. 
-      Before updating the player's position, the engine checks the target coordinates 
-      (with a +/- 0.2 buffer radius). If a wall is detected, the movement along that 
-      specific axis is rejected. This independent axis check allows the player to 
-      "slide" along walls rather than getting stuck.
-
-   6. LOOKUP TABLES (Pre-computed Floor Distances):
-      Floor and ceiling casting typically requires an expensive division operation 
-      for every single pixel (`distance = height / pixel_row`).
-      To optimize this, we pre-calculate these values into `doomhouse.dict_floor_dist`.
-      The engine performs a fast O(1) dictionary lookup instead of performing floating-point 
-      division at runtime.
-
-   7. OPTIMIZED SHADER PIPELINE (Pre-calculation):
-      Texture coordinate math (scaling, wrapping, clamping) is expensive.
-      - Pre-calculation: We calculate the dictionary lookup index (`w_tex_idx`, `f_tex_idx`) 
-        once per pixel in a subquery, rather than repeating the math for every color channel.
-      - Assembly: The final pixel color is packed into a UInt32 (0xBBGGRR) using 
-        fast bitwise shifts at the very end of the pipeline.
-
-   ========================================================================================
-*/
-
 CREATE MATERIALIZED VIEW doomhouse.render_materialized
 TO doomhouse.rendered_frame
 AS
 WITH 
     -- =========================================================
-    -- RESOLUTION SETTINGS
+    -- RESOLUTION & CONSTANTS
     -- =========================================================
-    -- Lower resolution = higher FPS. 640x480 is standard VGA.
     640 AS W,
     480 AS H,
     240 AS H_HALF,
+    
+    -- Field of View calculations (90 degrees)
+    -- Focal length calculation for projection
+    CAST(0.5 * W / 0.99, 'Float32') AS FOCAL_LEN, 
+    512 AS TEX_SIZE,
 
     -- =========================================================
-    -- MAP SETTINGS
+    -- PLAYER STATE (The "Camera")
     -- =========================================================
-    -- This constant is used to calculate 1D array indices from 2D coordinates.
-    15 AS MAP_W,
-    
-    -- =========================================================
-    -- TEXTURE SETTINGS
-    -- =========================================================
-    512 AS TEX_SIZE,
-    CAST(TEX_SIZE - 1, 'Int32') AS TEX_MAX,
-    
-    -- =========================================================
-    -- RAYCASTING SETTINGS
-    -- =========================================================
-    -- RAY_STEPS limits how far the engine "sees". 
-    -- Optimization: Keeping this low prevents processing too much array data per row.
-    25 AS RAY_STEPS,
-    CAST(1.0 / W, 'Float32') AS W_INV
+    -- We grab the latest input state once
+    (SELECT valid_x FROM doomhouse.player_input) AS p_x,
+    (SELECT valid_y FROM doomhouse.player_input) AS p_y,
+    (SELECT dir_x FROM doomhouse.player_input) AS p_dir_x, -- cos(angle)
+    (SELECT dir_y FROM doomhouse.player_input) AS p_dir_y, -- sin(angle)
+    -- Pre-calculate perpendicular vector for rotation matrix
+    (SELECT -dir_y FROM doomhouse.player_input) AS p_plane_x,
+    (SELECT dir_x FROM doomhouse.player_input) AS p_plane_y
 
 SELECT
-    -- Aggregating the final result into a single buffer for the frontend.
-    -- arraySort ensures pixels are ordered correctly (0..W) in the final blob.
-    any(valid_x) as pos_x,
-    any(valid_y) as pos_y,
-    arrayMap(x -> x.2, arraySort(k -> k.1, groupArray((y * W + x, final_color)))) AS image_data
+    -- =========================================================
+    -- STEP 5: FINAL FRAME BUFFER AGGREGATION
+    -- =========================================================
+    -- Unlike Raycasting (which is naturally sorted 0..W), projection
+    -- produces unordered fragments. We must group by Screen X.
+    x AS pos_x,
+    0 AS pos_y, -- Placeholder, logic handles full column
+    
+    -- We render vertical strips. 
+    -- For every X, we have a column of pixels.
+    groupArray((y_pixel, color)) AS column_data
 
 FROM
 (
     SELECT
-        x, y,
-        valid_x, valid_y,
+        screen_x AS x,
+        y_coord AS y_pixel,
         
         -- =========================================================
-        -- SHADING & TEXTURE MAPPING LOGIC (THE "PIXEL SHADER")
+        -- STEP 4: PIXEL SHADING (WALLS, FLOORS, CEILINGS)
         -- =========================================================
-        -- This 'multiIf' acts as the pixel shader.
-        -- It calculates the final RGB integer based on whether the pixel is Wall, Ceiling, or Floor.
         multiIf(
-            -- CASE 1: DRAWING A WALL
-            toInt32(y) >= draw_start AND toInt32(y) <= draw_end,
+            -- DRAW WALL
+            y_coord >= draw_start AND y_coord <= draw_end,
             CAST(
-                -- OPTIMIZATION: Channel Split & Pre-calc
-                -- 1. Instead of unpacking a UInt32 color (bitShiftRight + bitAnd), we access
-                --    separate 'r', 'g', 'b' columns (UInt8) directly from the dictionary.
-                -- 2. We use the pre-calculated 'w_tex_idx' calculated in the subquery below.
-                --    This prevents calculating the texture coordinate 3 times per pixel.
-                -- 3. We use bitOr/bitShiftLeft to pack the result into 0xBBGGRR format.
+                -- Calculate Texture U (horizontal) based on hit percentage along wall
+                -- Calculate Texture V (vertical) based on height
                 bitOr(
-                    bitOr(
-                        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_wall1_data', 'r', w_tex_idx) * base_shade), 0),
-                        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_wall1_data', 'g', w_tex_idx) * base_shade), 8)
-                    ),
-                    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_wall1_data', 'b', w_tex_idx) * base_shade), 16)
+                    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_textures', 'r', tex_idx) * shade), 0),
+                    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_textures', 'g', tex_idx) * shade), 8),
+                    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_textures', 'b', tex_idx) * shade), 16)
                 )
             , 'UInt32'),
-
-            -- CASE 2: DRAWING CEILING
-            -- Uses 'floor_shade' (distance based) to darken the ceiling further away.
-            toInt32(y) < draw_start,
-            CAST(
-                bitOr(
-                    bitOr(
-                        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_ceiling_data', 'r', f_tex_idx) * floor_shade), 0),
-                        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_ceiling_data', 'g', f_tex_idx) * floor_shade), 8)
-                    ),
-                    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_ceiling_data', 'b', f_tex_idx) * floor_shade), 16)
-                )
-            , 'UInt32'),
-
-            -- CASE 3: DRAWING FLOOR
-            CAST(
-                bitOr(
-                    bitOr(
-                        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_floor_data', 'r', f_tex_idx) * floor_shade), 0),
-                        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_floor_data', 'g', f_tex_idx) * floor_shade), 8)
-                    ),
-                    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_floor_data', 'b', f_tex_idx) * floor_shade), 16)
-                )
-            , 'UInt32')
-        ) AS final_color
-    FROM 
-    (
-        SELECT 
-            x, y,
-            rays.valid_x, rays.valid_y,
-
-            rays.draw_start, rays.draw_end, rays.base_shade, 
-
-            -- LIGHTING EFFECT: Distance Fog (Floor/Ceiling)
-            -- As 'floor_dist' increases, the shade value drops from 1.0 towards 0.0.
-            (1.0 - least(floor_dist * 0.125, 1.0)) as floor_shade,
-
-            -- =========================================================
-            -- OPTIMIZATION: PRE-CALCULATED TEXTURE INDICES
-            -- =========================================================
-            -- Previously, the texture index math was repeated 3 times (once per color channel) 
-            -- inside the shader. Now we calculate the exact dictionary key ONCE per pixel here.
             
-            -- Wall Texture Index Calculation:
-            toUInt64((least(greatest(toInt32(y * rays.tex_step + rays.tex_base), 0), TEX_MAX) * TEX_SIZE) + rays.tx + 1) as w_tex_idx,
-
-            -- Floor/Ceiling Texture Index Calculation:
-            -- We cast a ray from the player's feet to the pixel on screen to map it to a texture coordinate (f_tx, f_ty).
-            toUInt64((
-                bitAnd(toInt32((rays.valid_y + floor_dist * ((rays.hit_y - rays.valid_y) / (rays.perp_wall_dist + 0.001))) * TEX_SIZE), TEX_MAX) * TEX_SIZE) 
-                + bitAnd(toInt32((rays.valid_x + floor_dist * ((rays.hit_x - rays.valid_x) / (rays.perp_wall_dist + 0.001))) * TEX_SIZE), TEX_MAX) 
-                + 1
-            ) as f_tex_idx
-
-        FROM 
+            -- DRAW VISIBLE FLOOR (DOOM has variable height floors)
+            y_coord > draw_end,
+            0x333333, -- Simple floor color (or perform floor projection math here)
+            
+            -- DRAW VISIBLE CEILING
+            0x111111  -- Simple ceiling color
+        ) AS color
+        
+    FROM
+    (
+        SELECT
+            screen_x,
+            -- Generate vertical pixels for this column
+            arrayJoin(range(0, H)) AS y_coord,
+            
+            draw_start, draw_end,
+            tex_u, 
+            -- Interpolate texture V coordinate
+            toUInt64((y_coord - draw_start) / (draw_end - draw_start + 0.01) * TEX_SIZE) * TEX_SIZE + tex_u + 1 AS tex_idx,
+            
+            -- Lighting based on depth
+            1.0 / (depth + 0.1) * 5.0 AS shade
+        FROM
         (
-            -- =========================================================
-            -- STAGE 1: RAY GEOMETRY & WALL CALCULATION
-            -- =========================================================
-            SELECT 
-                x, valid_x, valid_y,
-                -- Determine which vertical pixels contain the wall strip
-                toInt32(H_HALF - (H / (perp_wall_dist + 0.0001)) * 0.5) AS draw_start,
-                toInt32(H_HALF + (H / (perp_wall_dist + 0.0001)) * 0.5) AS draw_end,
+            SELECT
+                screen_x,
+                depth,
                 
-                -- Texture scaling factors for the vertical strip
-                (1.0 / (H / (perp_wall_dist + 0.0001))) * TEX_SIZE as tex_step,
-                -(H_HALF - (H / (perp_wall_dist + 0.0001)) * 0.5) * tex_step as tex_base,
+                -- Project Wall Heights to Screen
+                -- DOOM Feature: Variable sector heights (top/bottom)
+                toInt32(H_HALF - (H * (sect_ceil - 0.0) / depth)) AS draw_start,
+                toInt32(H_HALF + (H * (0.0 - sect_floor) / depth)) AS draw_end,
                 
-                -- LIGHTING EFFECT: Fake Contrast & Fog
-                -- 1. `if(side, 0.6, 1.0)` checks if the ray hit a N/S wall or E/W wall. 
-                --    We darken one side to 0.6 to create pseudo-3D contrast at corners.
-                -- 2. `(1.0 - least(...))` applies distance fog. If hit_dist > 20, it's pitch black.
-                (if(side, 0.6, 1.0) * (1.0 - least(least(hit_dist, 20.0) * 0.125, 1.0))) AS base_shade,
+                -- Texture Mapping (U coordinate)
+                -- We know where we are on the screen relative to the projected wall edges
+                toUInt64((screen_x - proj_x1) / (proj_x2 - proj_x1 + 0.01) * wall_length * TEX_SIZE) AS tex_u,
                 
-                least(if(side, hit_x_wall, hit_y_wall), TEX_MAX) AS tx,
-                
-                -- Pass through raw hit data for floor calculation
-                hit_x, hit_y, perp_wall_dist
-            FROM 
+                sect_ceil, sect_floor
+            FROM
             (
-                SELECT 
-                    *,
-                    -- =========================================================
-                    -- FISH-EYE EFFECT AVOIDANCE
-                    -- =========================================================
-                    -- Problem: If we use Euclidean distance (sqrt(dx^2 + dy^2)), walls look rounded 
-                    -- because rays at the edge of the screen travel further than center rays.
-                    -- Solution: Project the distance onto the camera plane direction vector.
-                    -- Formula: raw_dist * dot_product(player_dir, ray_dir)
-                    raw_hit_dist * (p_dir_x * r_dir_x + p_dir_y * r_dir_y) as perp_wall_dist,
-                    
-                    (valid_x + r_dir_x * raw_hit_dist) as hit_x,
-                    (valid_y + r_dir_y * raw_hit_dist) as hit_y,
-                    
-                    -- Texture mapping: Calculate where exactly on the wall unit the ray hit (0.0 to 1.0)
-                    toInt32((hit_x - floor(hit_x)) * TEX_SIZE) as hit_x_wall_raw,
-                    toInt32((hit_y - floor(hit_y)) * TEX_SIZE) as hit_y_wall_raw,
-                    
-                    -- Texture mirroring (visual fix for alignment)
-                    if(bitAnd(intHash32(toInt32(hit_y)), 1) = 0, TEX_MAX - hit_x_wall_raw, hit_x_wall_raw) as hit_x_wall,
-                    if(bitAnd(intHash32(toInt32(hit_x)), 1) = 0, TEX_MAX - hit_y_wall_raw, hit_y_wall_raw) as hit_y_wall
-                FROM 
+                -- =========================================================
+                -- STEP 3: OCCLUSION & Z-BUFFERING
+                -- =========================================================
+                -- In Raycasting, we stop at the first wall.
+                -- In Projection, we project ALL walls. 
+                -- We use 'argMin' to pick the closest wall for every screen column.
+                SELECT
+                    screen_x,
+                    argMin(trans_z, trans_z) AS depth, -- The "Z-Buffer"
+                    argMin(proj_x1, trans_z) AS proj_x1,
+                    argMin(proj_x2, trans_z) AS proj_x2,
+                    argMin(len, trans_z) AS wall_length,
+                    argMin(h_ceil, trans_z) AS sect_ceil,
+                    argMin(h_floor, trans_z) AS sect_floor
+                FROM
                 (
-                    SELECT *, least(dist_x, dist_y) as raw_hit_dist, least(dist_x, dist_y) as hit_dist, (dist_y < dist_x) as side
-                    FROM (
-                        -- OPTIMIZATION: Vectorized Raycasting
-                        -- SQL cannot do a "While Loop" efficiently per row.
-                        -- Instead, we generate an array of steps (1..RAY_STEPS) and map over them.
-                        -- We calculate the distance for every step and use arrayMin to find the first wall hit.                        
+                    SELECT 
+                        -- =========================================================
+                        -- STEP 2: RASTERIZATION (Line -> Columns)
+                        -- =========================================================
+                        -- "Explode" the wall segment into individual vertical strips (columns)
+                        arrayJoin(range(MAX(0, toInt32(proj_x1)), MIN(W, toInt32(proj_x2)))) AS screen_x,
+                        
+                        -- Interpolate Z (Depth) for this specific X column for accurate Z-buffering
+                        -- (Perspective correct interpolation)
+                        tz1 + (tz2 - tz1) * ((screen_x - proj_x1) / (proj_x2 - proj_x1)) AS trans_z,
+                        
+                        proj_x1, proj_x2, 
+                        dist AS len,
+                        ceil_h AS h_ceil, 
+                        floor_h AS h_floor,
+                        tz1, tz2
+                    FROM 
+                    (
+                        -- =========================================================
+                        -- STEP 1: GEOMETRY TRANSFORMATION & CLIPPING
+                        -- =========================================================
                         SELECT 
                             *,
-                            arrayMap(i -> (i - valid_x) / r_dir_x, steps) as d_x,
-                            -- Check X-axis intersections. Uses MAP_W for index calculation.
-                            arrayMin(arrayMap((d, i) -> if(d > 0 AND d < 30 AND dictGet('doomhouse.dict_map_data', 'val', toUInt64(floor(valid_y + r_dir_y * d) * MAP_W + floor(valid_x + r_dir_x * d + if(r_dir_x > 0, 0.005, -0.005)) + 1)) > 0, d, 999.0), d_x, steps)) as dist_x,
-                            
-                            arrayMap(i -> (i - valid_y) / r_dir_y, steps) as d_y,
-                            -- Check Y-axis intersections. Uses MAP_W for index calculation.
-                            arrayMin(arrayMap((d, i) -> if(d > 0 AND d < 30 AND dictGet('doomhouse.dict_map_data', 'val', toUInt64(floor(valid_y + r_dir_y * d + if(r_dir_y > 0, 0.005, -0.005)) * MAP_W + floor(valid_x + r_dir_x * d) + 1)) > 0, d, 999.0), d_y, steps)) as dist_y
+                            -- Perspective Projection: World Space -> Screen X coordinates
+                            (W/2) + (tx1 / tz1) * FOCAL_LEN AS proj_x1,
+                            (W/2) + (tx2 / tz2) * FOCAL_LEN AS proj_x2
                         FROM 
                         (
                             SELECT 
-                                -- SIMPLIFIED: Directly use the column number 0..W
-                                screen_col.number AS x,
-                                p.valid_x, p.valid_y,
-                                p.dir_x as p_dir_x, p.dir_y as p_dir_y,
-                                -- Calculate Ray Direction for this specific column (x)
-                                (p.dir_x + p.plane_x * (2.0 * screen_col.number * W_INV - 1.0)) as r_dir_x,
-                                (p.dir_y + p.plane_y * (2.0 * screen_col.number * W_INV - 1.0)) as r_dir_y,
-                                range(1, RAY_STEPS) as steps
-                            FROM 
-                            (
-                                -- =========================================================
-                                -- COLLISION DETECTION & PLAYER INPUT
-                                -- =========================================================
-                                SELECT 
-                                    toFloat32(dir_x) as dir_x, toFloat32(dir_y) as dir_y, 
-                                    toFloat32(plane_x) as plane_x, toFloat32(plane_y) as plane_y,
-                                    
-                                    -- Collision Logic Y:
-                                    -- Try to move Y. If the new coordinate hits a wall (dictGet > 0), 
-                                    -- we revert to 'old_y'. We add +/- 0.2 buffering to prevent sticking.
-                                    -- Uses MAP_W for index calculation.
-                                    if(dictGet('doomhouse.dict_map_data', 'val', toUInt64(floor(try_y + if(try_y > old_y, 0.2, -0.2)) * MAP_W + floor(valid_x_inter) + 1)) = 0, try_y, old_y) as valid_y,
-                                    valid_x_inter as valid_x
-                                FROM (
-                                    -- Collision Logic X:
-                                    -- Try to move X. If dictGet returns wall, keep old_x.
-                                    -- Uses MAP_W for index calculation.
-                                    SELECT *, if(dictGet('doomhouse.dict_map_data', 'val', toUInt64(floor(old_y) * MAP_W + floor(try_x + if(try_x > old_x, 0.2, -0.2)) + 1)) = 0, try_x, old_x) as valid_x_inter
-                                    FROM doomhouse.player_input
-                                ) AS pi
-                            ) AS p
-                            -- =========================================================
-                            -- SCREEN GENERATION (Simplified)
-                            -- =========================================================
-                            -- Instead of complex sharding, we simply join numbers(W) 
-                            -- to generate one row for every vertical column on the screen.
-                            CROSS JOIN numbers(W) AS screen_col
+                                -- 1. Translate Wall to be relative to Player
+                                (x1 - p_x) AS dx1, (y1 - p_y) AS dy1,
+                                (x2 - p_x) AS dx2, (y2 - p_y) AS dy2,
+                                
+                                -- 2. Rotate Wall around Player (World -> Camera Space)
+                                (dx1 * p_dir_x + dy1 * p_dir_y) AS tz1, -- Depth Z1
+                                (dx1 * p_plane_x + dy1 * p_plane_y) AS tx1, -- Lateral X1
+                                
+                                (dx2 * p_dir_x + dy2 * p_dir_y) AS tz2, -- Depth Z2
+                                (dx2 * p_plane_x + dy2 * p_plane_y) AS tx2, -- Lateral X2
+                                
+                                -- Pass through properties
+                                sqrt(pow(x2-x1,2) + pow(y2-y1,2)) AS dist,
+                                sector_floor AS floor_h,
+                                sector_ceil AS ceil_h
+                                
+                            FROM doomhouse.geometry_segs 
+                            -- 3. Frustum Culling (Simple)
+                            -- Ensure at least one point is in front of player (Z > 0)
+                            WHERE ( (x1 - p_x) * p_dir_x + (y1 - p_y) * p_dir_y > 0.1 )
+                               OR ( (x2 - p_x) * p_dir_x + (y2 - p_y) * p_dir_y > 0.1 )
                         )
+                        -- 4. Clipping Loop (Simplified)
+                        -- If a wall crosses the near plane (z=0), we must clip it mathematically
+                        -- to avoid "division by zero" or "wrapping around" artifacts.
+                        WHERE tz1 > 0.1 AND tz2 > 0.1 -- (Simplification: Cull walls crossing plane for this snippet)
                     )
                 )
+                GROUP BY screen_x
             )
-        ) AS rays
-        -- =========================================================
-        -- OPTIMIZATION: PRE-CALCULATED FLOOR DISTANCES
-        -- =========================================================
-        -- Instead of calculating floor distances per pixel (expensive division),
-        -- we join with a pre-calculated lookup table for vertical screen positions.
-        CROSS JOIN (
-            SELECT 
-                number as y,
-                if(number < H_HALF, toInt32(H - 1 - number), toInt32(number)) as dist_lookup_idx,
-                dictGet('doomhouse.dict_floor_dist', 'dist', toUInt64(dist_lookup_idx + 1)) as floor_dist
-            FROM numbers(H)
-        ) AS v_lines
-    ) AS sub
+        )
+    )
 )
+ORDER BY pos_x ASC
