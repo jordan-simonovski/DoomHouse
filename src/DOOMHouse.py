@@ -5,6 +5,7 @@ import array
 import math
 import os
 import time
+import struct
 import tkinter as tk
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from dotenv import load_dotenv
@@ -84,6 +85,14 @@ class DOOMHouse:
         self.root.bind("<KeyRelease>", self._on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Initial Player State (Defaults, may be overridden by WAD)
+        self.pos_x = 6.5
+        self.pos_y = 6.5
+        self.dir_x = -1.0
+        self.dir_y = 0.0
+        self.plane_x = 0.0
+        self.plane_y = 0.66
+
         # Connect to DB
         try:
             if USE_CHDB:
@@ -120,14 +129,6 @@ class DOOMHouse:
 
         # Frame tracking
         self.frame_id = 0
-
-        # Initial Player State
-        self.pos_x = 6.5
-        self.pos_y = 6.5
-        self.dir_x = -1.0
-        self.dir_y = 0.0
-        self.plane_x = 0.0
-        self.plane_y = 0.66
 
         # GUI Setup
         self.running = True
@@ -438,8 +439,167 @@ class DOOMHouse:
         self.execute_sql_script("src/SQL/create_source_tables.sql")
         self.execute_sql_script("src/SQL/create_dictionaries.sql")
         
-        # Populate BSP segments (a simple square room)
-        print("📐 Populating BSP segments...")
+        wad_path = os.path.join("maps", "Doom1.WAD")
+        if not os.path.exists(wad_path):
+            print(f"⚠️ Warning: WAD file '{wad_path}' not found. Falling back to square room.")
+            self._initialize_fallback_data()
+            return
+
+        print(f"📖 Loading level data from {wad_path}...")
+        try:
+            with open(wad_path, 'rb') as f:
+                # 1. Read Header
+                header = f.read(12)
+                ident, num_lumps, dict_offset = struct.unpack('<4sII', header)
+                ident = ident.decode('ascii').strip('\0')
+                if ident not in ['IWAD', 'PWAD']:
+                    raise ValueError(f"Invalid WAD identification: {ident}")
+
+                # 2. Read Directory
+                f.seek(dict_offset)
+                lumps = {}
+                lump_list = []
+                for i in range(num_lumps):
+                    entry = f.read(16)
+                    pos, size, name = struct.unpack('<II8s', entry)
+                    name = name.decode('ascii').strip('\0').upper()
+                    lumps[name] = (pos, size, i)
+                    lump_list.append({'name': name, 'pos': pos, 'size': size})
+
+                # 3. Find E1M1
+                if 'E1M1' not in lumps:
+                    raise ValueError("E1M1 not found in WAD")
+                
+                e1m1_idx = lumps['E1M1'][2]
+                
+                # Helper to get lump data by relative index
+                def get_lump_by_rel(rel_idx):
+                    target = lump_list[e1m1_idx + rel_idx]
+                    f.seek(target['pos'])
+                    return f.read(target['size'])
+
+                # Doom Level Lump Order:
+                # 0: NAME, 1: THINGS, 2: LINEDEFS, 3: SIDEDEFS, 4: VERTEXES, 5: SEGS, 
+                # 6: SSECTORS, 7: NODES, 8: SECTORS, 9: REJECT, 10: BLOCKMAP
+                
+                # 4. Parse VERTEXES
+                print("  - Parsing VERTEXES...")
+                vertex_data = get_lump_by_rel(4)
+                vertices = []
+                for i in range(0, len(vertex_data), 4):
+                    vertices.append(struct.unpack('<hh', vertex_data[i:i+4]))
+
+                # 5. Parse SECTORS
+                print("  - Parsing SECTORS...")
+                sector_data = get_lump_by_rel(8)
+                sectors = []
+                for i in range(0, len(sector_data), 26):
+                    s = struct.unpack('<hh8s8shhh', sector_data[i:i+26])
+                    floor_h, ceil_h = s[0], s[1]
+                    floor_tex = s[2].decode('ascii').strip('\0')
+                    ceil_tex = s[3].decode('ascii').strip('\0')
+                    sectors.append({'floor': floor_h, 'ceil': ceil_h, 'floor_tex': floor_tex, 'ceil_tex': ceil_tex})
+
+                # 6. Parse SIDEDEFS
+                print("  - Parsing SIDEDEFS...")
+                sidedef_data = get_lump_by_rel(3)
+                sidedefs = []
+                for i in range(0, len(sidedef_data), 30):
+                    s = struct.unpack('<hh8s8s8sh', sidedef_data[i:i+30])
+                    sector_idx = s[5]
+                    upper_tex = s[2].decode('ascii').strip('\0')
+                    lower_tex = s[3].decode('ascii').strip('\0')
+                    middle_tex = s[4].decode('ascii').strip('\0')
+                    sidedefs.append({'sector': sector_idx, 'upper': upper_tex, 'lower': lower_tex, 'middle': middle_tex})
+
+                # 7. Parse LINEDEFS
+                print("  - Parsing LINEDEFS...")
+                linedef_data = get_lump_by_rel(2)
+                linedefs = []
+                for i in range(0, len(linedef_data), 14):
+                    s = struct.unpack('<hhhhhhh', linedef_data[i:i+14])
+                    linedefs.append({'v1': s[0], 'v2': s[1], 'front': s[5], 'back': s[6]})
+
+                # 8. Parse THINGS (Player Start)
+                print("  - Parsing THINGS...")
+                thing_data = get_lump_by_rel(1)
+                for i in range(0, len(thing_data), 10):
+                    x, y, angle, type_id, options = struct.unpack('<hhhhh', thing_data[i:i+10])
+                    if type_id == 1: # Player 1 Start
+                        self.pos_x = x * 0.01
+                        self.pos_y = y * 0.01
+                        rad = math.radians(angle)
+                        self.dir_x = math.cos(rad)
+                        self.dir_y = math.sin(rad)
+                        self.plane_x = -math.sin(rad) * 0.66
+                        self.plane_y = math.cos(rad) * 0.66
+                        print(f"  📍 Player 1 Start: ({self.pos_x:.2f}, {self.pos_y:.2f}) at {angle}°")
+                        break
+
+                # 9. Parse SEGS and Resolve
+                print("  - Parsing SEGS...")
+                seg_data = get_lump_by_rel(5)
+                segments = []
+                unique_textures = set()
+                
+                for i in range(0, len(seg_data), 12):
+                    v1_idx, v2_idx, angle, line_idx, side, offset = struct.unpack('<hhhhhh', seg_data[i:i+12])
+                    
+                    # Resolve coordinates
+                    x1, y1 = vertices[v1_idx]
+                    x2, y2 = vertices[v2_idx]
+                    
+                    # Resolve heights
+                    line = linedefs[line_idx]
+                    side_idx = line['front'] if side == 0 else line['back']
+                    
+                    if side_idx != -1:
+                        sdef = sidedefs[side_idx]
+                        sect = sectors[sdef['sector']]
+                        floor_h = sect['floor'] * 0.01
+                        ceil_h = sect['ceil'] * 0.01
+                        
+                        # Collect textures
+                        unique_textures.add(sdef['middle'])
+                        unique_textures.add(sect['floor_tex'])
+                        unique_textures.add(sect['ceil_tex'])
+                    else:
+                        floor_h = 0.0
+                        ceil_h = 1.0
+                    
+                    segments.append([
+                        (i // 12) + 1,
+                        x1 * 0.01, y1 * 0.01,
+                        x2 * 0.01, y2 * 0.01,
+                        ceil_h, floor_h
+                    ])
+
+                print(f"  🎨 Unique textures found: {', '.join(sorted(filter(None, unique_textures)))}")
+                
+                # 10. Insert into DB
+                print(f"📐 Populating {len(segments)} BSP segments into ClickHouse...")
+                if USE_CHDB:
+                    # Batch insert for performance
+                    batch_size = 1000
+                    for i in range(0, len(segments), batch_size):
+                        batch = segments[i:i+batch_size]
+                        values = [f"({s[0]},{s[1]},{s[2]},{s[3]},{s[4]},{s[5]},{s[6]})" for s in batch]
+                        self.db_client.query(f"INSERT INTO doomhouse.bsp_source (id, x1, y1, x2, y2, ceil, floor) VALUES {','.join(values)}")
+                else:
+                    self.db_client.insert('doomhouse.bsp_source', segments)
+                
+                self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_segs")
+                print("✅ Level data loaded successfully.")
+
+        except Exception as e:
+            print(f"❌ Error loading WAD data: {e}")
+            import traceback
+            traceback.print_exc()
+            self._initialize_fallback_data()
+
+    def _initialize_fallback_data(self):
+        """Populate BSP segments with a simple square room as fallback."""
+        print("📐 Populating fallback BSP segments...")
         segments = [
             # id, x1, y1, x2, y2, ceil, floor
             [1, 1.0, 1.0, 8.0, 1.0, 1.0, 0.0], # North Wall
@@ -463,7 +623,7 @@ class DOOMHouse:
             
             self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_segs")
         except Exception as e:
-            print(f"Error populating BSP segments: {e}")
+            print(f"Error populating fallback BSP segments: {e}")
 
     def initialize_tables(self):
         # Re-create tables to ensure schema matches
