@@ -28,7 +28,7 @@ FROM
             , 'UInt32'),
 
             -- CASE 2: DRAW CEILING (Textured)
-            y < draw_start,
+            y < draw_start OR isNull(draw_start),
             CAST(
                 bitOr(
                     bitOr(
@@ -63,19 +63,20 @@ FROM
             p_dir_x, p_dir_y, p_plane_x, p_plane_y,
             
             -- Geometry Checks
-            (y >= draw_start AND y <= draw_end) AS is_wall,
-            draw_start, draw_end,
+            (not isNull(draw_start) AND y >= draw_start AND y <= draw_end) AS is_wall,
+            ifNull(draw_start, 240) AS draw_start, 
+            ifNull(draw_end, 240) AS draw_end,
             
             -- =========================================================
             -- WALL SHADING & TEXTURING
             -- =========================================================
-            least(1.0, 4.0 / (z_depth + 0.1)) AS w_shade,
+            least(1.0, 4.0 / (ifNull(z_depth, 100.0) + 0.1)) AS w_shade,
             
             -- Wall Texture Index
             toUInt64(
-                (tex_u + 
+                (ifNull(tex_u, 0) + 
                 bitAnd(
-                    toUInt32((y - draw_start) * (512 / (draw_end - draw_start + 0.01))), 
+                    toUInt32((y - draw_start) * (512 / (abs(draw_end - draw_start) + 0.01))), 
                     511
                 ) * 512) + 1
             ) AS w_tex_idx,
@@ -112,99 +113,64 @@ FROM
             -- Z-BUFFER / OCCLUSION (BSP Simulation)
             -- =========================================================
             SELECT
-                x,
+                all_x.x AS x,
                 any(valid_x) AS valid_x, any(valid_y) AS valid_y,
-                any(p_dir_x) AS p_dir_x, any(p_dir_y) AS p_dir_y,
-                any(p_plane_x) AS p_plane_x, any(p_plane_y) AS p_plane_y,
+                any(dir_x) AS p_dir_x, any(dir_y) AS p_dir_y,
+                any(plane_x) AS p_plane_x, any(plane_y) AS p_plane_y,
                 
                 -- Select the CLOSEST wall for this column
                 argMin(draw_start, z_depth_val) AS draw_start,
                 argMin(draw_end, z_depth_val) AS draw_end,
                 min(z_depth_val) AS z_depth,
                 argMin(tex_u, z_depth_val) AS tex_u,
-                any(id) AS id -- Add id to the aggregation
+                any(id) AS id
                 
-            FROM
-            (
+            FROM doomhouse.player_state AS camera
+            CROSS JOIN (SELECT arrayJoin(range(0, 640)) AS x) AS all_x
+            LEFT JOIN (
                 SELECT
-                    -- Horizontal Rasterization (Line -> Columns)
                     arrayJoin(range(screen_x_start, screen_x_end)) AS x,
-                    
-                    id, -- Pass id through
-                    valid_x, valid_y,
-                    p_dir_x, p_dir_y, p_plane_x, p_plane_y,
-                    
-                    -- Interpolate Z (Depth)
-                    (rz1 + (rz2 - rz1) * ((x - screen_x_start) / (screen_x_end - screen_x_start + 0.01))) AS z_depth_val,
-                    
-                    -- Project Wall Heights (Perspective Projection)
+                    id,
+                    rz1 + ((rz2 - rz1) * ((x - screen_x_start) / (screen_x_end - screen_x_start + 0.01))) AS z_depth_val,
                     toInt32(240 - (480 * (ceil_h - 0.5) / z_depth_val)) AS draw_start,
                     toInt32(240 + (480 * (0.5 - floor_h) / z_depth_val)) AS draw_end,
-                    
-                    -- Interpolate Texture U
                     toUInt32((x - screen_x_start) / (screen_x_end - screen_x_start + 0.01) * wall_len * 512) AS tex_u
-
-                FROM
-                (
+                FROM (
                     SELECT
                         *,
-                        -- Clamp X to screen width
                         greatest(0, least(640, if(proj_x1 < proj_x2, proj_x1, proj_x2))) AS screen_x_start,
                         least(640, greatest(0, if(proj_x1 < proj_x2, proj_x2, proj_x1))) AS screen_x_end,
-                        
                         if(proj_x1 < proj_x2, rz1, rz2) AS rz1,
                         if(proj_x1 < proj_x2, rz2, rz1) AS rz2,
-                        
-                        -- Map Properties
                         dictGet('doomhouse.dict_bsp_segs', 'ceil', id) AS ceil_h,
                         dictGet('doomhouse.dict_bsp_segs', 'floor', id) AS floor_h,
                         sqrt(pow(dx2-dx1, 2) + pow(dy2-dy1, 2)) AS wall_len
-
-                    FROM
-                    (
+                    FROM (
                         SELECT
-                            p_x AS valid_x, p_y AS valid_y,
-                            p_dir_x, p_dir_y, p_plane_x, p_plane_y,
                             id, dx1, dy1, dx2, dy2, rz1, rz2, rx1, rx2,
-                            
-                            -- Perspective Projection
                             toInt32((640 / 2) + (rx1 / rz1) * 320.0) AS proj_x1,
                             toInt32((640 / 2) + (rx2 / rz2) * 320.0) AS proj_x2
-                        FROM
-                        (
-                            -- World -> Camera Transformation
+                        FROM (
                             SELECT
                                 id,
-                                (dictGet('doomhouse.dict_bsp_segs', 'x1', id) - p_x) AS dx1,
-                                (dictGet('doomhouse.dict_bsp_segs', 'y1', id) - p_y) AS dy1,
-                                (dictGet('doomhouse.dict_bsp_segs', 'x2', id) - p_x) AS dx2,
-                                (dictGet('doomhouse.dict_bsp_segs', 'y2', id) - p_y) AS dy2,
-                                
-                                (dx1 * p_dir_x + dy1 * p_dir_y) AS rz1,
-                                (dx2 * p_dir_x + dy2 * p_dir_y) AS rz2,
-                                (dx1 * p_plane_x + dy1 * p_plane_y) AS rx1,
-                                (dx2 * p_plane_x + dy2 * p_plane_y) AS rx2,
-                                p_x, p_y, p_dir_x, p_dir_y, p_plane_x, p_plane_y
-                            FROM 
-                            -- Iterate all map segments
-                            (SELECT id FROM doomhouse.dict_bsp_segs) AS ids
-                            CROSS JOIN (
-                                SELECT 
-                                    valid_x AS p_x, valid_y AS p_y, 
-                                    dir_x AS p_dir_x, dir_y AS p_dir_y, 
-                                    plane_x AS p_plane_x, plane_y AS p_plane_y 
-                                FROM doomhouse.player_state
-                                LIMIT 1
-                            ) AS camera -- Join with camera vectors
+                                (dictGet('doomhouse.dict_bsp_segs', 'x1', id) - valid_x) AS dx1,
+                                (dictGet('doomhouse.dict_bsp_segs', 'y1', id) - valid_y) AS dy1,
+                                (dictGet('doomhouse.dict_bsp_segs', 'x2', id) - valid_x) AS dx2,
+                                (dictGet('doomhouse.dict_bsp_segs', 'y2', id) - valid_y) AS dy2,
+                                (dx1 * dir_x + dy1 * dir_y) AS rz1,
+                                (dx2 * dir_x + dy2 * dir_y) AS rz2,
+                                (dx1 * plane_x + dy1 * plane_y) AS rx1,
+                                (dx2 * plane_x + dy2 * plane_y) AS rx2,
+                                valid_x, valid_y, dir_x, dir_y, plane_x, plane_y
+                            FROM doomhouse.player_state
+                            CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_segs) AS ids
                         )
-                        -- Frustum Culling (Z > 0.1)
                         WHERE rz1 > 0.1 AND rz2 > 0.1
                     )
                 )
                 WHERE screen_x_end > screen_x_start
-            )
-            GROUP BY x
+            ) AS walls ON all_x.x = walls.x
+            GROUP BY all_x.x
         )
     )
 )
-GROUP BY x -- Added GROUP BY x to ensure aggregation works

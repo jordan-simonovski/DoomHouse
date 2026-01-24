@@ -22,6 +22,4 @@ CREATE DICTIONARY doomhouse.dict_bsp_segs (
 PRIMARY KEY id
 SOURCE(CLICKHOUSE(TABLE 'bsp_source' DB 'doomhouse'))
 LIFETIME(MIN 3600 MAX 3600)
-LAYOUT(FLAT());
-
--- Texture dictionaries are created and managed by the Python client in DOOMHouse.py
+LAYOUT(FLAT())

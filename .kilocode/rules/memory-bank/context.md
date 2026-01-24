@@ -7,11 +7,13 @@
 The DOOMHouse project is functional with a complete raycasting engine implemented in ClickHouse SQL. The Python client successfully renders frames and handles user input.
 
 ## Recent Changes
-- **BSP Architecture Migration**: Transitioned the rendering engine from raycasting to a BSP-based approach.
-- **Multi-Stage Pipeline**: Introduced `player_state` table and `player_state_mv` for collision resolution before rendering.
-- **Segment-Based Rendering**: Updated `render_view.sql` to project wall segments instead of casting rays.
-- **Python Client Updates**: Updated `DOOMHouse.py` to support the new pipeline, table names, and BSP segment initialization.
-- **Blog Post Documentation**: Added technical SQL snippets to `docs/blogpost_v1.md` covering collision detection, vectorized raycasting, texture mapping, shading, lighting, and post-processing.
+- **Fixed Render Pipeline**: Resolved an issue where `rendered_frame` was empty due to Materialized View chaining and inference problems.
+- **Optimized `render_view.sql`**: 
+    - Moved `player_state` to the top-level `FROM` clause to ensure MV triggers correctly.
+    - Removed erroneous `GROUP BY x` at the end of the MV.
+    - Implemented a `LEFT JOIN` with a full range of 640 columns to ensure consistent frame size (640x480).
+- **Fixed `create_dictionaries.sql`**: Removed syntax errors caused by trailing semicolons/comments.
+- **Debugged Pipeline**: Created `debug_pipeline.py` to trace data flow from `player_input_raw` to `rendered_frame_post_processed`.
 
 Based on Notes.md, the project evolved through several iterations:
 1. **Plans**: Initial planning (Gemini 3.0)
