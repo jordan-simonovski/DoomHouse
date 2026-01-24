@@ -187,7 +187,7 @@ FROM
                                 p_x, p_y, p_dir_x, p_dir_y, p_plane_x, p_plane_y
                             FROM 
                             -- Iterate all map segments
-                            (SELECT arrayJoin(range(1, 9)) AS id) AS ids
+                            (SELECT id FROM doomhouse.dict_bsp_segs) AS ids
                             CROSS JOIN (
                                 SELECT 
                                     valid_x AS p_x, valid_y AS p_y, 

@@ -48,7 +48,7 @@ CROSS JOIN
                 seg.y1 + t * wall_dy as closest_y
                 
             FROM doomhouse.player_input_raw AS input
-            CROSS JOIN (SELECT arrayJoin(range(1, 9)) AS id) AS wall_iter -- Reduced range
+            CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_segs) AS wall_iter
             CROSS JOIN
             (
                 -- =========================================================
@@ -82,7 +82,7 @@ CROSS JOIN
                             x1 + greatest(0.0, least(1.0, t)) * w_dx as closest_x,
                             y1 + greatest(0.0, least(1.0, t)) * w_dy as closest_y
                         FROM doomhouse.player_input_raw AS input
-                        CROSS JOIN (SELECT arrayJoin(range(1, 9)) AS id) AS ids -- Reduced range
+                        CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_segs) AS ids
                     )
                 )
                 GROUP BY old_x_val, try_x_val
