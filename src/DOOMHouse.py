@@ -242,8 +242,19 @@ class DOOMHouse:
         """Helper to create table, dictionary and load texture data."""
         engine = "Memory" if USE_CHDB else "MergeTree ORDER BY id"
         
+        # Map internal dictionary names to the ones expected by the BSP renderer
+        # The BSP renderer expects 'dict_tex_wall', 'dict_tex_floor_data', 'dict_tex_ceiling_data'
+        bsp_dict_map = {
+            "dict_tex_wall1_data": "dict_tex_wall",
+            "dict_tex_wall2_data": "dict_tex_wall2", # Not used yet but for consistency
+            "dict_tex_floor_data": "dict_tex_floor_data",
+            "dict_tex_ceiling_data": "dict_tex_ceiling_data"
+        }
+        
+        target_dict_name = bsp_dict_map.get(dict_name, dict_name)
+        
         try:
-            self._db_command(f"DROP DICTIONARY IF EXISTS doomhouse.{dict_name}")
+            self._db_command(f"DROP DICTIONARY IF EXISTS doomhouse.{target_dict_name}")
             self._db_command(f"DROP TABLE IF EXISTS doomhouse.{table_name}")
             self._db_command(f"""
                 CREATE TABLE doomhouse.{table_name} (
@@ -255,7 +266,7 @@ class DOOMHouse:
             """)
             
             self._db_command(f"""
-                CREATE DICTIONARY doomhouse.{dict_name} (
+                CREATE DICTIONARY doomhouse.{target_dict_name} (
                     id UInt32,
                     r UInt8,
                     g UInt8,
@@ -267,7 +278,7 @@ class DOOMHouse:
                 LAYOUT(FLAT())
             """)
         except Exception as e:
-            print(f"Error creating texture table/dictionary {dict_name}: {e}")
+            print(f"Error creating texture table/dictionary {target_dict_name}: {e}")
 
         texture_path = os.path.join("textures", texture_file)
         tex_data = self.load_texture(texture_path)
@@ -301,10 +312,10 @@ class DOOMHouse:
                 ]
                 self.db_client.insert(f'doomhouse.{table_name}', data)
             
-            print(f"🔄 Reloading dictionary doomhouse.{dict_name}...")
-            self._db_command(f"SYSTEM RELOAD DICTIONARY doomhouse.{dict_name}")
+            print(f"🔄 Reloading dictionary doomhouse.{target_dict_name}...")
+            self._db_command(f"SYSTEM RELOAD DICTIONARY doomhouse.{target_dict_name}")
         except Exception as e:
-            print(f"Error initializing texture {dict_name}: {e}")
+            print(f"Error initializing texture {target_dict_name}: {e}")
 
     def _db_command(self, sql):
         """Unified command execution for both chDB and Server."""
@@ -319,11 +330,13 @@ class DOOMHouse:
             # 1. Drop Materialized Views first
             self._db_command("DROP VIEW IF EXISTS doomhouse.render_materialized")
             self._db_command("DROP VIEW IF EXISTS doomhouse.post_process_materialized")
+            self._db_command("DROP VIEW IF EXISTS doomhouse.player_state_mv")
             
             # 2. Drop Dictionaries
             dicts = [
                 "dict_map_data", "dict_floor_dist", "dict_tex_data", "dict_tex_wall_data",
-                "dict_tex_wall1_data", "dict_tex_wall2_data", "dict_tex_floor_data", "dict_tex_ceiling_data"
+                "dict_tex_wall1_data", "dict_tex_wall2_data", "dict_tex_floor_data", "dict_tex_ceiling_data",
+                "dict_tex_wall", "dict_bsp_segs"
             ]
             for d in dicts:
                 self._db_command(f"DROP DICTIONARY IF EXISTS doomhouse.{d}")
@@ -332,7 +345,8 @@ class DOOMHouse:
             tables = [
                 "map_source", "floor_dist_source", "tex_source", "tex_wall_source",
                 "tex_wall1_source", "tex_wall2_source", "tex_floor_source", "tex_ceiling_source",
-                "player_input", "rendered_frame", "rendered_frame_post_processed"
+                "player_input", "player_input_raw", "player_state", "rendered_frame", "rendered_frame_post_processed",
+                "bsp_source"
             ]
             for t in tables:
                 self._db_command(f"DROP TABLE IF EXISTS doomhouse.{t}")
@@ -420,16 +434,45 @@ class DOOMHouse:
                 print(f"Error executing statement: {e}")
 
     def initialize_game_data(self):
-        print("🎮 Initializing game data (map, floor distances)...")
+        print("🎮 Initializing game data (map, floor distances, BSP segments)...")
         self.execute_sql_script("src/SQL/create_source_tables.sql")
         self.execute_sql_script("src/SQL/create_dictionaries.sql")
+        
+        # Populate BSP segments (a simple square room)
+        print("📐 Populating BSP segments...")
+        segments = [
+            # id, x1, y1, x2, y2, ceil, floor
+            [1, 1.0, 1.0, 8.0, 1.0, 1.0, 0.0], # North Wall
+            [2, 8.0, 1.0, 8.0, 8.0, 1.0, 0.0], # East Wall
+            [3, 8.0, 8.0, 1.0, 8.0, 1.0, 0.0], # South Wall
+            [4, 1.0, 8.0, 1.0, 1.0, 1.0, 0.0], # West Wall
+            
+            # Add some internal pillars
+            [5, 3.0, 3.0, 4.0, 3.0, 1.0, 0.0],
+            [6, 4.0, 3.0, 4.0, 4.0, 1.0, 0.0],
+            [7, 4.0, 4.0, 3.0, 4.0, 1.0, 0.0],
+            [8, 3.0, 4.0, 3.0, 3.0, 1.0, 0.0]
+        ]
+        
+        try:
+            if USE_CHDB:
+                values = [f"({s[0]},{s[1]},{s[2]},{s[3]},{s[4]},{s[5]},{s[6]})" for s in segments]
+                self.db_client.query(f"INSERT INTO doomhouse.bsp_source (id, x1, y1, x2, y2, ceil, floor) VALUES {','.join(values)}")
+            else:
+                self.db_client.insert('doomhouse.bsp_source', segments)
+            
+            self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_segs")
+        except Exception as e:
+            print(f"Error populating BSP segments: {e}")
 
     def initialize_tables(self):
         # Re-create tables to ensure schema matches
         sql_files = [
             "src/SQL/player_input_table.sql",
+            "src/SQL/player_state_table.sql",
             "src/SQL/rendered_frame_table.sql",
             "src/SQL/rendered_frame_post_processed_table.sql",
+            "src/SQL/player_state.sql",
             "src/SQL/render_view.sql",
             "src/SQL/post_process_view.sql",
         ]
@@ -482,8 +525,10 @@ class DOOMHouse:
         try:
             start_time = time.time()
             self.frame_id += 1
+            # TRUNCATE to ensure only one row triggers the MV
+            self._db_command("TRUNCATE TABLE doomhouse.player_input_raw")
             self._db_command(f"""
-                INSERT INTO doomhouse.player_input
+                INSERT INTO doomhouse.player_input_raw
                 (frame_id, old_x, old_y, try_x, try_y, dir_x, dir_y, plane_x, plane_y, timestamp)
                 VALUES ({self.frame_id}, {self.pos_x}, {self.pos_y}, {target_x}, {target_y},
                         {self.dir_x}, {self.dir_y}, {self.plane_x}, {self.plane_y}, now())
@@ -518,39 +563,67 @@ class DOOMHouse:
         try:
             start_time = time.time()
             
-            if USE_CHDB:
-                # Pull rendered frame from the materialized table using Arrow for zero-copy
-                result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed", "Arrow")
+            # Wait for the frame to be processed by the Materialized View pipeline
+            # We poll for a short time to ensure the MV has finished its work
+            max_retries = 50 # Increased retries
+            table = None
+            
+            for i in range(max_retries):
+                if USE_CHDB:
+                    # Pull rendered frame from the materialized table using Arrow for zero-copy
+                    result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed", "Arrow")
+                    
+                    # Use PyArrow to read the buffer without copying
+                    import pyarrow as pa
+                    try:
+                        reader = pa.ipc.open_stream(result.bytes())
+                        table = reader.read_all()
+                    except:
+                        try:
+                            reader = pa.ipc.open_file(result.bytes())
+                            table = reader.read_all()
+                        except:
+                            table = None
+                    
+                    if table and table.num_rows > 0:
+                        print(f"✅ Frame found after {i+1} retries.")
+                        break
+                else:
+                    # Server mode: use standard query
+                    result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed")
+                    if result.result_rows:
+                        # Convert to a format we can use below
+                        self.pos_x = result.result_rows[0][0]
+                        self.pos_y = result.result_rows[0][1]
+                        pixel_data = result.result_rows[0][2]
+                        import array
+                        raw_bytes = array.array('I', pixel_data).tobytes()
+                        table = True # Signal success
+                        print(f"✅ Frame found after {i+1} retries.")
+                        break
                 
-                # Use PyArrow to read the buffer without copying
-                import pyarrow as pa
-                try:
-                    reader = pa.ipc.open_stream(result.bytes())
-                    table = reader.read_all()
-                except:
-                    reader = pa.ipc.open_file(result.bytes())
-                    table = reader.read_all()
-                
-                if table.num_rows == 0:
-                    return
+                time.sleep(0.05) # Wait 50ms before retrying
+            
+            if not table:
+                print("⚠️ Warning: No frame data returned from database.")
+                # Debug: Check if intermediate tables have data
+                if USE_CHDB:
+                    try:
+                        input_count = self.db_client.query("SELECT count() FROM doomhouse.player_input_raw").bytes().decode().strip()
+                        state_count = self.db_client.query("SELECT count() FROM doomhouse.player_state").bytes().decode().strip()
+                        frame_count = self.db_client.query("SELECT count() FROM doomhouse.rendered_frame").bytes().decode().strip()
+                        print(f"DEBUG: input_raw={input_count}, state={state_count}, frame={frame_count}")
+                    except Exception as e:
+                        print(f"Debug Error: {e}")
+                return
 
+            if USE_CHDB:
                 self.pos_x = table.column('pos_x')[0].as_py()
                 self.pos_y = table.column('pos_y')[0].as_py()
                 pixel_data_list = table.column('image_data')[0]
                 import numpy as np
                 pixel_np = pixel_data_list.values.to_numpy()
                 raw_bytes = pixel_np.tobytes()
-            else:
-                # Server mode: use standard query
-                result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed")
-                if not result.result_rows:
-                    return
-                
-                self.pos_x = result.result_rows[0][0]
-                self.pos_y = result.result_rows[0][1]
-                pixel_data = result.result_rows[0][2]
-                import array
-                raw_bytes = array.array('I', pixel_data).tobytes()
 
             # Calculate render time
             select_time = (time.time() - start_time) * 1000 # in ms

@@ -46,3 +46,14 @@ CREATE TABLE IF NOT EXISTS doomhouse.tex_wall1_source (id UInt32, r UInt8, g UIn
 CREATE TABLE IF NOT EXISTS doomhouse.tex_wall2_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
 CREATE TABLE IF NOT EXISTS doomhouse.tex_floor_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
 CREATE TABLE IF NOT EXISTS doomhouse.tex_ceiling_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
+
+-- 4. BSP Segment Source
+CREATE TABLE IF NOT EXISTS doomhouse.bsp_source (
+    id UInt32,
+    x1 Float64,
+    y1 Float64,
+    x2 Float64,
+    y2 Float64,
+    ceil Float32,
+    floor Float32
+) ENGINE = MergeTree ORDER BY id;

@@ -6,14 +6,16 @@ DOOMHouse follows a unique client-server architecture where the database acts as
 
 ```mermaid
 graph TD
-    A[Python Client - Tkinter] -->|INSERT| B[doomhouse.player_input]
-    B -->|Trigger| C[doomhouse.render_materialized MV]
-    C -->|Populate| D[doomhouse.rendered_frame]
-    D -->|Trigger| E[doomhouse.post_process_materialized MV]
-    E -->|Populate| F[doomhouse.rendered_frame_post_processed]
-    A -->|SELECT| F
-    F -->|Array UInt32| A
-    A -->|Display| G[Tkinter Window]
+    A[Python Client - Tkinter] -->|INSERT| B[doomhouse.player_input_raw]
+    B -->|Trigger| C[doomhouse.player_state_mv]
+    C -->|Populate| D[doomhouse.player_state]
+    D -->|Trigger| E[doomhouse.render_materialized MV]
+    E -->|Populate| F[doomhouse.rendered_frame]
+    F -->|Trigger| G[doomhouse.post_process_materialized MV]
+    G -->|Populate| H[doomhouse.rendered_frame_post_processed]
+    A -->|SELECT| H
+    H -->|Array UInt32| A
+    A -->|Display| I[Tkinter Window]
 ```
 
 ## Source Code Structure
@@ -23,12 +25,14 @@ DoomHouse/
 ├── src/
 │   ├── DOOMHouse.py          # Main Python client application
 │   └── SQL/
-│       ├── player_input_table.sql   # Input table definition
+│       ├── player_input_table.sql   # Raw input table definition
+│       ├── player_state_table.sql   # Resolved camera state table
+│       ├── player_state.sql         # Collision resolution MV
 │       ├── rendered_frame_table.sql # Raw frame buffer table
 │       ├── rendered_frame_post_processed_table.sql # Final frame buffer
-│       ├── render_view.sql          # Core Raycasting MV
+│       ├── render_view.sql          # Core BSP-based Rendering MV
 │       ├── post_process_view.sql    # SWAR-based Blur/Smoothing MV
-│       ├── create_dictionaries.sql  # Map and Texture dictionaries
+│       ├── create_dictionaries.sql  # Map, Texture, and BSP dictionaries
 │       └── create_source_tables.sql # Source data for dictionaries
 ├── textures/                  # External texture directory
 ├── .kilocode/
@@ -46,47 +50,48 @@ The single [`DOOMHouse`](src/DOOMHouse.py:53) class encapsulates all client logi
 | Method | Purpose |
 |--------|---------|
 | [`__init__()`](src/DOOMHouse.py:54) | Initialize Tkinter window, connect to DB, setup frame tracking |
-| [`run()`](src/DOOMHouse.py:457) | Main loop handling input and splash screen |
-| [`process_input()`](src/DOOMHouse.py:412) | Handle keyboard state and calculate target movement |
-| [`push_input()`](src/DOOMHouse.py:437) | Insert player state into ClickHouse |
-| [`render()`](src/DOOMHouse.py:473) | Pull `Array(UInt32)` from DB, convert to bytes, display via PIL/Tkinter |
-| [`switch_theme()`](src/DOOMHouse.py:278) | Cycle through texture themes (Classic, Dungeon) |
+| [`run()`](src/DOOMHouse.py:501) | Main loop handling input and splash screen |
+| [`process_input()`](src/DOOMHouse.py:456) | Handle keyboard state and calculate target movement |
+| [`push_input()`](src/DOOMHouse.py:481) | Insert player state into ClickHouse |
+| [`render()`](src/DOOMHouse.py:517) | Pull `Array(UInt32)` from DB, convert to bytes, display via PIL/Tkinter |
+| [`switch_theme()`](src/DOOMHouse.py:580) | Cycle through texture themes (Classic, Dungeon) |
 
 ### SQL Rendering Engine
 
-The rendering logic is split into two stages:
+The rendering logic is split into three stages:
 
 ```mermaid
 graph LR
     subgraph SQL Pipeline
-        A[doomhouse.player_input] --> B[render_view.sql]
-        B --> C[doomhouse.rendered_frame]
-        C --> D[post_process_view.sql]
-        D --> E[doomhouse.rendered_frame_post_processed]
+        A[doomhouse.player_input_raw] --> B[player_state.sql]
+        B --> C[doomhouse.player_state]
+        C --> D[render_view.sql]
+        D --> E[doomhouse.rendered_frame]
+        E --> F[post_process_view.sql]
+        F --> G[doomhouse.rendered_frame_post_processed]
     end
 ```
 
 #### Key SQL Components
 
-1. **Map & Texture Dictionaries** ([`create_dictionaries.sql`](src/SQL/create_dictionaries.sql:1))
-   - Map data and textures are stored in ClickHouse Dictionaries for O(1) lookup.
+1. **BSP & Texture Dictionaries** ([`create_dictionaries.sql`](src/SQL/create_dictionaries.sql:1))
+   - Wall segments and textures are stored in ClickHouse Dictionaries for O(1) lookup.
    - Textures are split into separate R, G, B channels to avoid bit-unpacking overhead.
 
-2. **Collision Logic** ([`render_view.sql`](src/SQL/render_view.sql:273))
-   - "Slide-and-collide" logic: checks X and Y axes independently.
-   - Uses a 0.2 unit buffer to prevent sticking to walls.
+2. **Collision Logic** ([`player_state.sql`](src/SQL/player_state.sql:1))
+   - "Slide-and-collide" logic: checks X and Y axes independently against BSP segments.
+   - Uses a 0.3 unit buffer to prevent sticking to walls.
 
-3. **Vectorized Raycasting** ([`render_view.sql`](src/SQL/render_view.sql:244))
-   - Replaces loops with `arrayMap` and `range(1, RAY_STEPS)`.
-   - Finds first wall intersection using `arrayMin`.
+3. **BSP Rendering** ([`render_view.sql`](src/SQL/render_view.sql:1))
+   - Projects wall segments from 3D world space to 2D screen space.
+   - Uses perspective projection and Z-buffering (via `argMin`) to handle occlusion.
 
 4. **Post-Processing (SWAR)** ([`post_process_view.sql`](src/SQL/post_process_view.sql:1))
    - Implements a box blur/smoothing filter.
    - Uses SIMD Within A Register (SWAR) to process R and B channels in parallel within a single UInt32.
 
-5. **Lighting & Fog** ([`render_view.sql`](src/SQL/render_view.sql:203))
-   - Distance-based fog (fades to black at 20 units).
-   - Fake contrast (N/S walls are 40% darker).
+5. **Lighting & Fog** ([`render_view.sql`](src/SQL/render_view.sql:100))
+   - Distance-based fog (fades to black).
 
 ## Data Flow
 
