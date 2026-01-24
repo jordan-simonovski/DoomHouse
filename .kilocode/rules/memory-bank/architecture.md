@@ -33,7 +33,8 @@ DoomHouse/
 │       ├── render_view.sql          # Core BSP-based Rendering MV
 │       ├── post_process_view.sql    # SWAR-based Blur/Smoothing MV
 │       ├── create_dictionaries.sql  # Map, Texture, and BSP dictionaries
-│       └── create_source_tables.sql # Source data for dictionaries
+│       ├── create_source_tables.sql # Source data for dictionaries
+│       └── resolve_geometry.sql     # WAD Geometry Resolution Logic
 ├── textures/                  # External texture directory
 ├── .kilocode/
 │   └── rules/
@@ -55,6 +56,7 @@ The single [`DOOMHouse`](src/DOOMHouse.py:53) class encapsulates all client logi
 | [`push_input()`](src/DOOMHouse.py:481) | Insert player state into ClickHouse |
 | [`render()`](src/DOOMHouse.py:517) | Pull `Array(UInt32)` from DB, convert to bytes, display via PIL/Tkinter |
 | [`switch_theme()`](src/DOOMHouse.py:580) | Cycle through texture themes (Classic, Dungeon) |
+| [`initialize_game_data()`](src/DOOMHouse.py:437) | Parse WAD file, populate `wad_*` tables, and resolve geometry |
 
 ### SQL Rendering Engine
 
@@ -74,24 +76,26 @@ graph LR
 
 #### Key SQL Components
 
-1. **BSP & Texture Dictionaries** ([`create_dictionaries.sql`](src/SQL/create_dictionaries.sql:1))
-   - Wall segments and textures are stored in ClickHouse Dictionaries for O(1) lookup.
-   - Textures are split into separate R, G, B channels to avoid bit-unpacking overhead.
+1. **WAD Data & Geometry Resolution** ([`create_source_tables.sql`](src/SQL/create_source_tables.sql:1))
+   - Raw WAD lumps (VERTEXES, SECTORS, LINEDEFS, SEGS, etc.) are stored in `wad_*` tables.
+   - `resolve_geometry.sql` joins these tables to create `bsp_resolved`, which contains fully resolved wall segments (coordinates, heights, textures, light).
+   - `dict_bsp_resolved` provides O(1) access to this data.
 
 2. **Collision Logic** ([`player_state.sql`](src/SQL/player_state.sql:1))
    - "Slide-and-collide" logic: checks X and Y axes independently against BSP segments.
    - Uses a 0.3 unit buffer to prevent sticking to walls.
 
-3. **BSP Rendering** ([`render_view.sql`](src/SQL/render_view.sql:1))
-   - Projects wall segments from 3D world space to 2D screen space.
-   - Uses perspective projection and Z-buffering (via `argMin`) to handle occlusion.
+3. **BSP Rasterization** ([`render_view.sql`](src/SQL/render_view.sql:1))
+   - Projects *all* wall segments from 3D world space to 2D screen space.
+   - Uses a Z-buffer approach (`argMin`) to find the closest wall for each screen column.
+   - Handles perspective projection and clipping.
 
 4. **Post-Processing (SWAR)** ([`post_process_view.sql`](src/SQL/post_process_view.sql:1))
    - Implements a box blur/smoothing filter.
    - Uses SIMD Within A Register (SWAR) to process R and B channels in parallel within a single UInt32.
 
 5. **Lighting & Fog** ([`render_view.sql`](src/SQL/render_view.sql:100))
-   - Distance-based fog (fades to black).
+   - Uses WAD sector light levels (0-255) combined with distance-based shading.
 
 ## Data Flow
 
@@ -154,120 +158,67 @@ Uses `cityHash64()` with wall block coordinates as seed. Same wall block always 
 
 ---
 
-## SQL Raycasting Algorithm Deep Dive
+## SQL Rasterization Algorithm Deep Dive
 
-The raycasting implementation in SQL is the core innovation of DOOMHouse. This section explains how the algorithm works within the constraints of ClickHouse SQL.
+The rendering engine uses a "Rasterization" approach rather than traditional Raycasting. Instead of casting rays for every pixel, it projects all wall segments to the screen and uses a Z-buffer to determine visibility.
 
-### Overview
+### Step 1: Camera Transform
 
-Traditional raycasting uses a DDA (Digital Differential Analysis) algorithm with while-loops to step through the map grid. Since ClickHouse lacks true while-loops or recursive CTEs, DOOMHouse uses a clever distance-sorting approach instead.
+For every wall segment in `dict_bsp_resolved`:
+1. Translate relative to player position (`dx = x - pos_x`).
+2. Rotate by player direction (inverse camera matrix).
+3. Result is `(rz, rx)` where `rz` is depth and `rx` is horizontal position in camera space.
 
-### Step 1: Ray Direction Calculation
+### Step 2: Clipping
 
-For each screen column `x` from 0 to W-1:
+Segments behind the player (`rz < near_plane`) are clipped or discarded.
+- If partially visible, the segment is shortened to the near plane (Z=0.1).
+- New coordinates `(rx1_c, rz1_c)` and `(rx2_c, rz2_c)` are calculated.
 
+### Step 3: Perspective Projection
+
+Project 3D camera coordinates to 2D screen coordinates:
 ```sql
-2.0 * number / W - 1.0 AS camera_x,           -- Maps column to [-1, 1]
-dir_x + plane_x * camera_x AS ray_dir_x,      -- Ray X component
-dir_y + plane_y * camera_x AS ray_dir_y       -- Ray Y component
+proj_x = 320.0 + (rx / rz) * 320.0
 ```
+This maps the segment to a range of screen columns `[screen_x_start, screen_x_end]`.
 
-The `camera_x` value converts pixel column to camera-space coordinate. The player's direction vector `(dir_x, dir_y)` plus camera plane `(plane_x, plane_y)` creates a 66° FOV typical of classic Doom-like games.
+### Step 4: Rasterization (Column Loop)
 
-### Step 2: Distance Candidate Generation
+For each visible segment, we iterate through the screen columns it covers (`arrayJoin(range(start, end))`).
+For each column `x`:
+1. Calculate `t` (interpolation factor along the wall).
+2. Interpolate depth `z_depth = 1.0 / (1/z1 + t * (1/z2 - 1/z1))`.
+3. Calculate wall height on screen: `draw_start` and `draw_end`.
 
-Instead of stepping through the grid, DOOMHouse pre-computes all possible intersection distances:
+### Step 5: Z-Buffering
 
+Since multiple walls might project to the same screen column `x`, we group by `x` and find the closest one:
 ```sql
-arraySort(arrayConcat(
-    -- X-axis grid line intersections (vertical walls)
-    arrayMap(i -> (floor(valid_x) + (ray_dir_x > 0 ? i : -i + 1) - valid_x) / ray_dir_x,
-             range(1, 14)),
-    -- Y-axis grid line intersections (horizontal walls)
-    arrayMap(i -> (floor(valid_y) + (ray_dir_y > 0 ? i : -i + 1) - valid_y) / ray_dir_y,
-             range(1, 14))
-)) AS dists
+argMin(draw_start, z_depth_val) AS draw_start,
+argMin(draw_end, z_depth_val) AS draw_end,
+min(z_depth_val) AS z_depth
 ```
+This effectively implements a Z-buffer in SQL.
 
-This generates up to 26 candidate distances (13 for each axis) sorted from nearest to farthest. The `range(1, 14)` limits view distance to 13 cells.
+### Step 6: Shading & Coloring
 
-### Step 3: First Wall Hit Detection
-
-The `arrayFirst()` function finds the first distance where a wall exists:
-
-```sql
-arrayFirst(d ->
-    d > 0 AND
-    toInt32(ceil(valid_y + ray_dir_y * (d + 0.001))) BETWEEN 1 AND 8 AND
-    toInt32(ceil(valid_x + ray_dir_x * (d + 0.001))) BETWEEN 1 AND 8 AND
-    substring(
-        map[toInt32(ceil(valid_y + ray_dir_y * (d + 0.001)))],
-        toInt32(ceil(valid_x + ray_dir_x * (d + 0.001))),
-        1
-    ) IN ('1', '2')
-, dists) AS raw_dist
-```
-
-Key points:
-- `d + 0.001` nudges past the exact intersection to sample inside the cell
-- `ceil()` converts world coordinates to 1-based map indices
-- `substring()` extracts the character at that map position
-- `IN ('1', '2')` checks for wall types (empty is '0')
-
-### Step 4: Wall Height Calculation
-
-Perpendicular distance avoids fisheye distortion:
+The final color is calculated using:
+- **Texture**: Looked up via `dictGet` (currently simplified to solid colors/shading in `render_view.sql`).
+- **Lighting**: `light_level` from WAD (0-255).
+- **Distance Fog**: `4.0 / (z_depth + 0.1)`.
 
 ```sql
-raw_hit_dist * (p_dir_x * r_dir_x + p_dir_y * r_dir_y) as perp_wall_dist,
-toInt32(H_HALF - (H / (perp_wall_dist + 0.0001)) * 0.5) AS draw_start,
-toInt32(H_HALF + (H / (perp_wall_dist + 0.0001)) * 0.5) AS draw_end
-```
-
-The wall height is inversely proportional to distance. `0.0001` prevents division by zero.
-
-### Step 5: Side Detection
-
-Determines if a vertical or horizontal wall was hit for shading:
-
-```sql
-(dist_y < dist_x) as side
-```
-
-If the distance to the Y-axis intersection is smaller, we hit a horizontal wall (side=true).
-
-### Step 6: Texture Coordinate Mapping
-
-```sql
--- Texture mapping: Calculate where exactly on the wall unit the ray hit (0.0 to 1.0)
-toInt32((hit_x - floor(hit_x)) * TEX_SIZE) as hit_x_wall_raw,
-toInt32((hit_y - floor(hit_y)) * TEX_SIZE) as hit_y_wall_raw,
-
--- Texture mirroring (visual fix for alignment)
-if(bitAnd(intHash32(toInt32(hit_y)), 1) = 0, TEX_MAX - hit_x_wall_raw, hit_x_wall_raw) as hit_x_wall,
-if(bitAnd(intHash32(toInt32(hit_x)), 1) = 0, TEX_MAX - hit_y_wall_raw, hit_y_wall_raw) as hit_y_wall
-```
-
-### Step 7: Pixel Color Assembly (Packed UInt32)
-
-```sql
--- Channel Split & Pre-calc
-bitOr(
-    bitOr(
-        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_wall1_data', 'r', w_tex_idx) * base_shade), 0),
-        bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_wall1_data', 'g', w_tex_idx) * base_shade), 8)
-    ),
-    bitShiftLeft(toUInt32(dictGet('doomhouse.dict_tex_wall1_data', 'b', w_tex_idx) * base_shade), 16)
-) AS final_color
+least(1.0, (light_level / 255.0) * (4.0 / (z_depth + 0.1))) AS w_shade
 ```
 
 ### Performance Characteristics
 
 | Operation | Complexity |
 |-----------|------------|
-| Ray generation | O(W) - linear with screen width |
-| Distance sorting | O(26 log 26) per ray - constant |
-| Pixel rendering | O(W × H) - 307,200 operations |
-| Texture lookups | O(W × H) - one per visible wall pixel |
+| Projection | O(N) - N = number of wall segments |
+| Rasterization | O(S) - S = total screen area covered by all walls (overdraw) |
+| Z-Buffering | O(S) - Sorting/Aggregating per column |
+| Pixel Rendering | O(W × H) |
 
-The algorithm trades memory (pre-computed distance arrays) for the ability to run without loops, making it feasible in SQL.
+This approach is efficient for sparse maps (like Doom) where N is relatively small compared to the number of rays in a raycaster. It leverages ClickHouse's columnar processing power for the massive `arrayJoin` operations.

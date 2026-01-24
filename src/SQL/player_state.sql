@@ -48,7 +48,7 @@ CROSS JOIN
                 seg.y1 + t * wall_dy as closest_y
                 
             FROM doomhouse.player_input_raw AS input
-            CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_segs) AS wall_iter
+            CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_resolved) AS wall_iter
             CROSS JOIN
             (
                 -- =========================================================
@@ -69,10 +69,10 @@ CROSS JOIN
                             input.old_y AS old_y_val,
                             input.old_x AS old_x_val,
                             
-                            dictGet('doomhouse.dict_bsp_segs', 'x1', id) as x1,
-                            dictGet('doomhouse.dict_bsp_segs', 'y1', id) as y1,
-                            dictGet('doomhouse.dict_bsp_segs', 'x2', id) as x2,
-                            dictGet('doomhouse.dict_bsp_segs', 'y2', id) as y2,
+                            dictGet('doomhouse.dict_bsp_resolved', 'x1', id) as x1,
+                            dictGet('doomhouse.dict_bsp_resolved', 'y1', id) as y1,
+                            dictGet('doomhouse.dict_bsp_resolved', 'x2', id) as x2,
+                            dictGet('doomhouse.dict_bsp_resolved', 'y2', id) as y2,
                             
                             (x2 - x1) as w_dx, (y2 - y1) as w_dy,
                             
@@ -82,12 +82,12 @@ CROSS JOIN
                             x1 + greatest(0.0, least(1.0, t)) * w_dx as closest_x,
                             y1 + greatest(0.0, least(1.0, t)) * w_dy as closest_y
                         FROM doomhouse.player_input_raw AS input
-                        CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_segs) AS ids
+                        CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_resolved) AS ids
                     )
                 )
                 GROUP BY old_x_val, try_x_val
             ) AS r1
-            LEFT JOIN doomhouse.dict_bsp_segs AS seg ON wall_iter.id = seg.id
+            LEFT JOIN doomhouse.dict_bsp_resolved AS seg ON wall_iter.id = seg.id
         )
     )
     GROUP BY safe_x, old_y_val, try_y_val

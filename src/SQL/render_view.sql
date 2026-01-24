@@ -67,7 +67,8 @@ FROM
             ifNull(draw_end, 240) AS draw_end,
             
             -- Shading Math
-            least(1.0, 4.0 / (ifNull(z_depth, 100.0) + 0.1)) AS w_shade,
+            -- Use light_level from WAD (0-255) combined with distance shading
+            least(1.0, (ifNull(light_level, 255) / 255.0) * (4.0 / (ifNull(z_depth, 100.0) + 0.1))) AS w_shade,
             (1.0 - least((240 / (abs(y - 240) + 0.01)) * 0.125, 1.0)) AS f_shade
 
         FROM
@@ -81,7 +82,8 @@ FROM
                 -- Z-Buffer Logic: Find the closest wall for this X column
                 argMin(draw_start, z_depth_val) AS draw_start,
                 argMin(draw_end, z_depth_val) AS draw_end,
-                min(z_depth_val) AS z_depth
+                min(z_depth_val) AS z_depth,
+                argMin(light_level, z_depth_val) AS light_level
                 
             FROM doomhouse.player_state AS camera
             CROSS JOIN (SELECT arrayJoin(range(0, 640)) AS x) AS all_x
@@ -97,7 +99,9 @@ FROM
 
                     -- PERSPECTIVE PROJECTION OF HEIGHT
                     toInt32(240 - (480 * (ceil_h - 0.5) / z_depth_val)) AS draw_start,
-                    toInt32(240 + (480 * (0.5 - floor_h) / z_depth_val)) AS draw_end
+                    toInt32(240 + (480 * (0.5 - floor_h) / z_depth_val)) AS draw_end,
+                    
+                    light_level
                     
                 FROM (
                     SELECT
@@ -118,14 +122,14 @@ FROM
                     FROM (
                         -- PROJECTION STAGE
                         SELECT 
-                            ceil_h, floor_h,
+                            ceil_h, floor_h, light_level,
                             rz1_c, rz2_c,
                             320.0 + (rx1_c / rz1_c) * 320.0 AS proj_x1,
                             320.0 + (rx2_c / rz2_c) * 320.0 AS proj_x2
                         FROM (
                             -- CLIPPING STAGE (Homogeneous Clip against Z=0.1)
                             SELECT
-                                ceil_h, floor_h,
+                                ceil_h, floor_h, light_level,
                                 rx1, rz1, rx2, rz2,
                                 0.1 AS near,
                                 (near - rz1) / (rz2 - rz1 + 0.00001) AS clip_t,
@@ -137,18 +141,22 @@ FROM
                             FROM (
                                 -- CAMERA TRANSFORM
                                 SELECT
-                                    dictGet('doomhouse.dict_bsp_segs', 'ceil', id) AS ceil_h,
-                                    dictGet('doomhouse.dict_bsp_segs', 'floor', id) AS floor_h,
-                                    (dictGet('doomhouse.dict_bsp_segs', 'x1', id) - valid_x) AS dx1,
-                                    (dictGet('doomhouse.dict_bsp_segs', 'y1', id) - valid_y) AS dy1,
-                                    (dictGet('doomhouse.dict_bsp_segs', 'x2', id) - valid_x) AS dx2,
-                                    (dictGet('doomhouse.dict_bsp_segs', 'y2', id) - valid_y) AS dy2,
+                                    dictGet('doomhouse.dict_bsp_resolved', 'ceil', id) AS ceil_h,
+                                    dictGet('doomhouse.dict_bsp_resolved', 'floor', id) AS floor_h,
+                                    dictGet('doomhouse.dict_bsp_resolved', 'light', id) AS light_level,
+                                    dictGet('doomhouse.dict_bsp_resolved', 'wall_tex', id) AS wall_tex,
+                                    dictGet('doomhouse.dict_bsp_resolved', 'ceil_tex', id) AS ceil_tex,
+                                    dictGet('doomhouse.dict_bsp_resolved', 'floor_tex', id) AS floor_tex,
+                                    (dictGet('doomhouse.dict_bsp_resolved', 'x1', id) - valid_x) AS dx1,
+                                    (dictGet('doomhouse.dict_bsp_resolved', 'y1', id) - valid_y) AS dy1,
+                                    (dictGet('doomhouse.dict_bsp_resolved', 'x2', id) - valid_x) AS dx2,
+                                    (dictGet('doomhouse.dict_bsp_resolved', 'y2', id) - valid_y) AS dy2,
                                     (dx1 * dir_x + dy1 * dir_y) AS rz1,
                                     (dx2 * dir_x + dy2 * dir_y) AS rz2,
                                     (dx1 * plane_x + dy1 * plane_y) AS rx1,
                                     (dx2 * plane_x + dy2 * plane_y) AS rx2
                                 FROM doomhouse.player_state
-                                CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_segs) AS ids
+                                CROSS JOIN (SELECT id FROM doomhouse.dict_bsp_resolved) AS ids
                             )
                             WHERE rz1 >= near OR rz2 >= near
                         )

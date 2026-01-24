@@ -337,7 +337,7 @@ class DOOMHouse:
             dicts = [
                 "dict_map_data", "dict_floor_dist", "dict_tex_data", "dict_tex_wall_data",
                 "dict_tex_wall1_data", "dict_tex_wall2_data", "dict_tex_floor_data", "dict_tex_ceiling_data",
-                "dict_tex_wall", "dict_bsp_segs"
+                "dict_tex_wall", "dict_bsp_segs", "dict_bsp_resolved"
             ]
             for d in dicts:
                 self._db_command(f"DROP DICTIONARY IF EXISTS doomhouse.{d}")
@@ -347,7 +347,8 @@ class DOOMHouse:
                 "map_source", "floor_dist_source", "tex_source", "tex_wall_source",
                 "tex_wall1_source", "tex_wall2_source", "tex_floor_source", "tex_ceiling_source",
                 "player_input", "player_input_raw", "player_state", "rendered_frame", "rendered_frame_post_processed",
-                "bsp_source"
+                "bsp_source", "bsp_resolved",
+                "wad_vertexes", "wad_sectors", "wad_sidedefs", "wad_linedefs", "wad_segs", "wad_things"
             ]
             for t in tables:
                 self._db_command(f"DROP TABLE IF EXISTS doomhouse.{t}")
@@ -482,49 +483,56 @@ class DOOMHouse:
                 # 0: NAME, 1: THINGS, 2: LINEDEFS, 3: SIDEDEFS, 4: VERTEXES, 5: SEGS, 
                 # 6: SSECTORS, 7: NODES, 8: SECTORS, 9: REJECT, 10: BLOCKMAP
                 
-                # 4. Parse VERTEXES
+                # 4. Parse VERTEXES -> wad_vertexes
                 print("  - Parsing VERTEXES...")
                 vertex_data = get_lump_by_rel(4)
-                vertices = []
+                vertex_rows = []
                 for i in range(0, len(vertex_data), 4):
-                    vertices.append(struct.unpack('<hh', vertex_data[i:i+4]))
+                    x, y = struct.unpack('<hh', vertex_data[i:i+4])
+                    vertex_rows.append((len(vertex_rows), x, y)) # id, x, y
 
-                # 5. Parse SECTORS
+                # 5. Parse SECTORS -> wad_sectors
                 print("  - Parsing SECTORS...")
                 sector_data = get_lump_by_rel(8)
-                sectors = []
+                sector_rows = []
                 for i in range(0, len(sector_data), 26):
                     s = struct.unpack('<hh8s8shhh', sector_data[i:i+26])
                     floor_h, ceil_h = s[0], s[1]
                     floor_tex = s[2].decode('ascii').strip('\0')
                     ceil_tex = s[3].decode('ascii').strip('\0')
-                    sectors.append({'floor': floor_h, 'ceil': ceil_h, 'floor_tex': floor_tex, 'ceil_tex': ceil_tex})
+                    light, special, tag = s[4], s[5], s[6]
+                    sector_rows.append((len(sector_rows), floor_h, ceil_h, floor_tex, ceil_tex, light, special, tag))
 
-                # 6. Parse SIDEDEFS
+                # 6. Parse SIDEDEFS -> wad_sidedefs
                 print("  - Parsing SIDEDEFS...")
                 sidedef_data = get_lump_by_rel(3)
-                sidedefs = []
+                sidedef_rows = []
                 for i in range(0, len(sidedef_data), 30):
                     s = struct.unpack('<hh8s8s8sh', sidedef_data[i:i+30])
-                    sector_idx = s[5]
-                    upper_tex = s[2].decode('ascii').strip('\0')
-                    lower_tex = s[3].decode('ascii').strip('\0')
-                    middle_tex = s[4].decode('ascii').strip('\0')
-                    sidedefs.append({'sector': sector_idx, 'upper': upper_tex, 'lower': lower_tex, 'middle': middle_tex})
+                    x_off, y_off = s[0], s[1]
+                    upper = s[2].decode('ascii').strip('\0')
+                    lower = s[3].decode('ascii').strip('\0')
+                    middle = s[4].decode('ascii').strip('\0')
+                    sector_id = s[5]
+                    sidedef_rows.append((len(sidedef_rows), x_off, y_off, upper, lower, middle, sector_id))
 
-                # 7. Parse LINEDEFS
+                # 7. Parse LINEDEFS -> wad_linedefs
                 print("  - Parsing LINEDEFS...")
                 linedef_data = get_lump_by_rel(2)
-                linedefs = []
+                linedef_rows = []
                 for i in range(0, len(linedef_data), 14):
                     s = struct.unpack('<hhhhhhh', linedef_data[i:i+14])
-                    linedefs.append({'v1': s[0], 'v2': s[1], 'front': s[5], 'back': s[6]})
+                    v1, v2, flags, special, tag, front, back = s
+                    linedef_rows.append((len(linedef_rows), v1, v2, flags, special, tag, front, back))
 
-                # 8. Parse THINGS (Player Start)
+                # 8. Parse THINGS -> wad_things (and set player start)
                 print("  - Parsing THINGS...")
                 thing_data = get_lump_by_rel(1)
+                thing_rows = []
                 for i in range(0, len(thing_data), 10):
                     x, y, angle, type_id, options = struct.unpack('<hhhhh', thing_data[i:i+10])
+                    thing_rows.append((len(thing_rows), x, y, angle, type_id, options))
+                    
                     if type_id == 1: # Player 1 Start
                         self.pos_x = x * 0.01
                         self.pos_y = y * 0.01
@@ -534,62 +542,52 @@ class DOOMHouse:
                         self.plane_x = -math.sin(rad) * 0.66
                         self.plane_y = math.cos(rad) * 0.66
                         print(f"  📍 Player 1 Start: ({self.pos_x:.2f}, {self.pos_y:.2f}) at {angle}°")
-                        break
 
-                # 9. Parse SEGS and Resolve
+                # 9. Parse SEGS -> wad_segs
                 print("  - Parsing SEGS...")
                 seg_data = get_lump_by_rel(5)
-                segments = []
-                unique_textures = set()
-                
+                seg_rows = []
                 for i in range(0, len(seg_data), 12):
-                    v1_idx, v2_idx, angle, line_idx, side, offset = struct.unpack('<hhhhhh', seg_data[i:i+12])
-                    
-                    # Resolve coordinates
-                    x1, y1 = vertices[v1_idx]
-                    x2, y2 = vertices[v2_idx]
-                    
-                    # Resolve heights
-                    line = linedefs[line_idx]
-                    side_idx = line['front'] if side == 0 else line['back']
-                    
-                    if side_idx != -1:
-                        sdef = sidedefs[side_idx]
-                        sect = sectors[sdef['sector']]
-                        floor_h = sect['floor'] * 0.01
-                        ceil_h = sect['ceil'] * 0.01
-                        
-                        # Collect textures
-                        unique_textures.add(sdef['middle'])
-                        unique_textures.add(sect['floor_tex'])
-                        unique_textures.add(sect['ceil_tex'])
-                    else:
-                        floor_h = 0.0
-                        ceil_h = 1.0
-                    
-                    segments.append([
-                        (i // 12) + 1,
-                        x1 * 0.01, y1 * 0.01,
-                        x2 * 0.01, y2 * 0.01,
-                        ceil_h, floor_h
-                    ])
+                    v1, v2, angle, linedef_id, side, offset = struct.unpack('<hhhhhh', seg_data[i:i+12])
+                    seg_rows.append((len(seg_rows), v1, v2, angle, linedef_id, side, offset))
 
-                print(f"  🎨 Unique textures found: {', '.join(sorted(filter(None, unique_textures)))}")
-                
                 # 10. Insert into DB
-                print(f"📐 Populating {len(segments)} BSP segments into ClickHouse...")
-                if USE_CHDB:
-                    # Batch insert for performance
-                    batch_size = 1000
-                    for i in range(0, len(segments), batch_size):
-                        batch = segments[i:i+batch_size]
-                        values = [f"({s[0]},{s[1]},{s[2]},{s[3]},{s[4]},{s[5]},{s[6]})" for s in batch]
-                        self.db_client.query(f"INSERT INTO doomhouse.bsp_source (id, x1, y1, x2, y2, ceil, floor) VALUES {','.join(values)}")
-                else:
-                    self.db_client.insert('doomhouse.bsp_source', segments)
+                print("📐 Populating WAD tables into ClickHouse...")
                 
-                self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_segs")
-                print("✅ Level data loaded successfully.")
+                def insert_rows(table, rows, columns):
+                    if not rows: return
+                    if USE_CHDB:
+                        # Batch insert for performance
+                        batch_size = 5000
+                        for i in range(0, len(rows), batch_size):
+                            batch = rows[i:i+batch_size]
+                            # Format values based on type
+                            values = []
+                            for row in batch:
+                                row_vals = []
+                                for val in row:
+                                    if isinstance(val, str):
+                                        row_vals.append(f"'{val}'")
+                                    else:
+                                        row_vals.append(str(val))
+                                values.append(f"({','.join(row_vals)})")
+                            self.db_client.query(f"INSERT INTO doomhouse.{table} ({columns}) VALUES {','.join(values)}")
+                    else:
+                        self.db_client.insert(f'doomhouse.{table}', rows)
+
+                insert_rows('wad_vertexes', vertex_rows, 'id, x, y')
+                insert_rows('wad_sectors', sector_rows, 'id, floor_h, ceil_h, floor_tex, ceil_tex, light, special, tag')
+                insert_rows('wad_sidedefs', sidedef_rows, 'id, x_off, y_off, upper, lower, middle, sector_id')
+                insert_rows('wad_linedefs', linedef_rows, 'id, v1, v2, flags, special, tag, front_side, back_side')
+                insert_rows('wad_things', thing_rows, 'id, x, y, angle, type, options')
+                insert_rows('wad_segs', seg_rows, 'id, v1, v2, angle, linedef_id, side, offset')
+
+                # 11. Resolve Geometry
+                print("🔄 Resolving geometry (SEGS -> BSP Resolved)...")
+                self.execute_sql_script("src/SQL/resolve_geometry.sql")
+                
+                self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_resolved")
+                print("✅ Level data loaded and resolved successfully.")
 
         except Exception as e:
             print(f"❌ Error loading WAD data: {e}")

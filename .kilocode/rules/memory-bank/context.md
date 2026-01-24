@@ -7,6 +7,7 @@
 The DOOMHouse project is functional with a complete raycasting engine implemented in ClickHouse SQL. The Python client successfully renders frames and handles user input.
 
 ## Recent Changes
+- **WAD Data Integration**: Refactored the engine to load raw Doom WAD data into ClickHouse tables (`wad_vertexes`, `wad_sectors`, etc.) and resolve geometry using SQL (`bsp_resolved`).
 - **Fixed Render Pipeline**: Resolved an issue where `rendered_frame` was empty due to Materialized View chaining and inference problems.
 - **Optimized `render_view.sql`**: 
     - Moved `player_state` to the top-level `FROM` clause to ensure MV triggers correctly.
@@ -26,6 +27,7 @@ Based on Notes.md, the project evolved through several iterations:
 8. **Post-Processing Pipeline**: Added a second Materialized View for SWAR-based smoothing/blurring.
 9. **Dictionary Optimization**: Moved map and textures to ClickHouse Dictionaries with split R/G/B channels.
 10. **Theme Support**: Added interactive theme switching (Classic/Dungeon) and high-res texture support (512x512).
+11. **WAD Data Structures**: Moved "source of truth" for level geometry to ClickHouse tables, enabling SQL-side geometry resolution.
 
 
 Latest implementation includes:
@@ -34,6 +36,7 @@ Latest implementation includes:
 - **SWAR Post-Processing**: SIMD-style blur implemented in SQL.
 - **Slide-and-Collide**: Improved collision detection in SQL.
 - **Distance Lookups**: Pre-computed floor/ceiling distances for performance.
+- **WAD-based Geometry**: Raw WAD lumps stored in DB and resolved to BSP segments via SQL.
 
 ## Current Work Focus
 Maintaining documentation and exploring further SQL-side optimizations.
@@ -47,6 +50,7 @@ Maintaining documentation and exploring further SQL-side optimizations.
 - [x] Create requirements.txt for Python dependencies
 - [x] Add README.md with setup instructions
 - [x] Expand README.md with Architecture and Optimizations details
+- [x] Implement WAD data loading and SQL-side geometry resolution
 - [ ] Consider continuous render loop option for smoother movement
 - [ ] Explore ClickHouseDB optimizations for better frame rates
 - [ ] Add more wall texture types for visual variety

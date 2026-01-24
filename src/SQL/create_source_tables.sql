@@ -47,13 +47,79 @@ CREATE TABLE IF NOT EXISTS doomhouse.tex_wall2_source (id UInt32, r UInt8, g UIn
 CREATE TABLE IF NOT EXISTS doomhouse.tex_floor_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
 CREATE TABLE IF NOT EXISTS doomhouse.tex_ceiling_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
 
--- 4. BSP Segment Source
-CREATE TABLE IF NOT EXISTS doomhouse.bsp_source (
+-- 4. BSP Segment Source (Replaced by WAD tables)
+-- CREATE TABLE IF NOT EXISTS doomhouse.bsp_source ...
+
+-- 5. Raw WAD Tables
+CREATE TABLE IF NOT EXISTS doomhouse.wad_vertexes (
+    id UInt32,
+    x Int16,
+    y Int16
+) ENGINE = MergeTree ORDER BY id;
+
+CREATE TABLE IF NOT EXISTS doomhouse.wad_sectors (
+    id UInt32,
+    floor_h Int16,
+    ceil_h Int16,
+    floor_tex String,
+    ceil_tex String,
+    light UInt8,
+    special UInt16,
+    tag UInt16
+) ENGINE = MergeTree ORDER BY id;
+
+CREATE TABLE IF NOT EXISTS doomhouse.wad_sidedefs (
+    id UInt32,
+    x_off Int16,
+    y_off Int16,
+    upper String,
+    lower String,
+    middle String,
+    sector_id UInt16
+) ENGINE = MergeTree ORDER BY id;
+
+CREATE TABLE IF NOT EXISTS doomhouse.wad_linedefs (
+    id UInt32,
+    v1 UInt16,
+    v2 UInt16,
+    flags Int16,
+    special Int16,
+    tag Int16,
+    front_side Int16,
+    back_side Int16
+) ENGINE = MergeTree ORDER BY id;
+
+CREATE TABLE IF NOT EXISTS doomhouse.wad_segs (
+    id UInt32,
+    v1 UInt16,
+    v2 UInt16,
+    angle Int16,
+    linedef_id UInt16,
+    side Int16,
+    offset Int16
+) ENGINE = MergeTree ORDER BY id;
+
+CREATE TABLE IF NOT EXISTS doomhouse.wad_things (
+    id UInt32,
+    x Int16,
+    y Int16,
+    angle Int16,
+    type Int16,
+    options Int16
+) ENGINE = MergeTree ORDER BY id;
+
+-- 6. Resolved BSP Table
+CREATE TABLE IF NOT EXISTS doomhouse.bsp_resolved (
     id UInt32,
     x1 Float64,
     y1 Float64,
     x2 Float64,
     y2 Float64,
     ceil Float32,
-    floor Float32
+    floor Float32,
+    wall_tex String,
+    ceil_tex String,
+    floor_tex String,
+    light UInt8,
+    sector_id UInt16
 ) ENGINE = MergeTree ORDER BY id;
