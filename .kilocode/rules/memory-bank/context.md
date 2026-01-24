@@ -8,6 +8,7 @@ The DOOMHouse project is functional with a complete raycasting engine implemente
 
 ## Recent Changes
 - **WAD Data Integration**: Refactored the engine to load raw Doom WAD data into ClickHouse tables (`wad_vertexes`, `wad_sectors`, etc.) and resolve geometry using SQL (`bsp_resolved`).
+- **Level Listing**: Added logic to `src/DOOMHouse.py` to automatically find and print all levels (e.g., E1M1-E1M9) found in the WAD file during initialization.
 - **Fixed Render Pipeline**: Resolved an issue where `rendered_frame` was empty due to Materialized View chaining and inference problems.
 - **Optimized `render_view.sql`**: 
     - Moved `player_state` to the top-level `FROM` clause to ensure MV triggers correctly.

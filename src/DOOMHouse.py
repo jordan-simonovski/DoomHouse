@@ -6,6 +6,7 @@ import math
 import os
 import time
 import struct
+import re
 import tkinter as tk
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from dotenv import load_dotenv
@@ -466,6 +467,11 @@ class DOOMHouse:
                     name = name.decode('ascii').strip('\0').upper()
                     lumps[name] = (pos, size, i)
                     lump_list.append({'name': name, 'pos': pos, 'size': size})
+
+                # Find all levels in the WAD
+                level_pattern = re.compile(r'^(E\dM\d|MAP\d\d)$')
+                all_levels = [l['name'] for l in lump_list if level_pattern.match(l['name'])]
+                print(f"🗺️ Found {len(all_levels)} levels in WAD: {', '.join(all_levels)}")
 
                 # 3. Find E1M1
                 if 'E1M1' not in lumps:
