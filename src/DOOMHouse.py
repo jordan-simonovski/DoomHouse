@@ -474,7 +474,7 @@ class DOOMHouse:
             "src/SQL/rendered_frame_post_processed_table.sql",
             "src/SQL/player_state.sql",
             "src/SQL/render_view.sql",
-            "src/SQL/post_process_view.sql",
+            #"src/SQL/post_process_view.sql",
         ]
         
         for sql_file in sql_files:
@@ -571,7 +571,8 @@ class DOOMHouse:
             for i in range(max_retries):
                 if USE_CHDB:
                     # Pull rendered frame from the materialized table using Arrow for zero-copy
-                    result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed", "Arrow")
+                    #result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed", "Arrow")
+                    result = self.db_client.query("SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame", "Arrow")
                     
                     # Use PyArrow to read the buffer without copying
                     import pyarrow as pa
