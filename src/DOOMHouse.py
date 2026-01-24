@@ -585,8 +585,7 @@ class DOOMHouse:
                         except:
                             table = None
                     
-                    if table and table.num_rows > 0:
-                        print(f"✅ Frame found after {i+1} retries.")
+                    if table and table.num_rows > 0:                        
                         break
                 else:
                     # Server mode: use standard query
@@ -598,8 +597,7 @@ class DOOMHouse:
                         pixel_data = result.result_rows[0][2]
                         import array
                         raw_bytes = array.array('I', pixel_data).tobytes()
-                        table = True # Signal success
-                        print(f"✅ Frame found after {i+1} retries.")
+                        table = True # Signal success                        
                         break
                 
                 time.sleep(0.05) # Wait 50ms before retrying
