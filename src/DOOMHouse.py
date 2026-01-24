@@ -122,8 +122,8 @@ class DOOMHouse:
         self.frame_id = 0
 
         # Initial Player State
-        self.pos_x = 3.5
-        self.pos_y = 3.5
+        self.pos_x = 6.5
+        self.pos_y = 6.5
         self.dir_x = -1.0
         self.dir_y = 0.0
         self.plane_x = 0.0
