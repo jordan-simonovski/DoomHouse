@@ -436,10 +436,67 @@ class DOOMHouse:
             except Exception as e:
                 print(f"Error executing statement: {e}")
 
+    def load_playpal(self, f, lumps):
+        if 'PLAYPAL' not in lumps:
+            print("⚠️ Warning: PLAYPAL not found. Using grayscale palette.")
+            return [(i, i, i) for i in range(256)]
+        
+        pos, size, _ = lumps['PLAYPAL']
+        f.seek(pos)
+        data = f.read(768) # Read first palette (256 * 3)
+        palette = []
+        for i in range(0, 768, 3):
+            r, g, b = struct.unpack('BBB', data[i:i+3])
+            palette.append((r, g, b))
+        return palette
+
+    def load_flats(self, f, lumps, lump_list, palette):
+        if 'F_START' not in lumps or 'F_END' not in lumps:
+            print("⚠️ Warning: F_START/F_END not found.")
+            return [], []
+
+        f_start_idx = lumps['F_START'][2]
+        f_end_idx = lumps['F_END'][2]
+        
+        print(f"🎨 Loading Flats from index {f_start_idx} to {f_end_idx}...")
+        
+        texture_infos = []
+        texture_pixels = []
+        
+        # Start ID for textures. Let's reserve 0.
+        # Flats will be 1..N
+        current_id = 1
+        
+        for i in range(f_start_idx + 1, f_end_idx):
+            lump = lump_list[i]
+            name = lump['name']
+            if lump['size'] != 4096: # 64x64 = 4096 bytes
+                continue
+                
+            f.seek(lump['pos'])
+            data = f.read(4096)
+            
+            texture_infos.append((current_id, name, 64, 64, 'flat'))
+            
+            # Process pixels
+            for y in range(64):
+                for x in range(64):
+                    color_idx = data[y * 64 + x]
+                    r, g, b = palette[color_idx]
+                    # Pack color: 0x00BBGGRR (Little Endian UInt32)
+                    # R is lowest byte
+                    packed_color = r | (g << 8) | (b << 16)
+                    texture_pixels.append((current_id, x, y, packed_color))
+            
+            current_id += 1
+            
+        return texture_infos, texture_pixels
+
     def initialize_game_data(self):
         print("🎮 Initializing game data (map, floor distances, BSP segments)...")
         self.execute_sql_script("src/SQL/create_source_tables.sql")
         self.execute_sql_script("src/SQL/create_dictionaries.sql")
+        self.execute_sql_script("src/SQL/create_wad_texture_tables.sql")
         
         wad_path = os.path.join("maps", "Doom1.WAD")
         if not os.path.exists(wad_path):
@@ -467,6 +524,47 @@ class DOOMHouse:
                     name = name.decode('ascii').strip('\0').upper()
                     lumps[name] = (pos, size, i)
                     lump_list.append({'name': name, 'pos': pos, 'size': size})
+
+                # Load Palette
+                palette = self.load_playpal(f, lumps)
+                
+                # Load Flats
+                flat_infos, flat_pixels = self.load_flats(f, lumps, lump_list, palette)
+                
+                # Insert Texture Data
+                print(f"💾 Inserting {len(flat_infos)} flats and {len(flat_pixels)} pixels...")
+                
+                def insert_rows(table, rows, columns):
+                    if not rows: return
+                    if USE_CHDB:
+                        # Batch insert for performance
+                        batch_size = 50000 # Increased batch size for pixels
+                        for i in range(0, len(rows), batch_size):
+                            batch = rows[i:i+batch_size]
+                            # Format values based on type
+                            values = []
+                            for row in batch:
+                                row_vals = []
+                                for val in row:
+                                    if isinstance(val, str):
+                                        row_vals.append(f"'{val}'")
+                                    else:
+                                        row_vals.append(str(val))
+                                values.append(f"({','.join(row_vals)})")
+                            self.db_client.query(f"INSERT INTO doomhouse.{table} ({columns}) VALUES {','.join(values)}")
+                    else:
+                        # For server, we might need smaller batches or direct insert
+                        batch_size = 50000
+                        for i in range(0, len(rows), batch_size):
+                            batch = rows[i:i+batch_size]
+                            self.db_client.insert(f'doomhouse.{table}', batch)
+
+                insert_rows('wad_texture_info', flat_infos, 'id, name, width, height, type')
+                insert_rows('wad_texture_data', flat_pixels, 'tex_id, u, v, color')
+                
+                # Reload Dictionaries
+                self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_wad_texture_name_to_id")
+                self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_wad_texture_pixels")
 
                 # Find all levels in the WAD
                 level_pattern = re.compile(r'^(E\dM\d|MAP\d\d)$')
@@ -504,8 +602,8 @@ class DOOMHouse:
                 for i in range(0, len(sector_data), 26):
                     s = struct.unpack('<hh8s8shhh', sector_data[i:i+26])
                     floor_h, ceil_h = s[0], s[1]
-                    floor_tex = s[2].decode('ascii').strip('\0')
-                    ceil_tex = s[3].decode('ascii').strip('\0')
+                    floor_tex = s[2].decode('ascii').strip('\0').upper()
+                    ceil_tex = s[3].decode('ascii').strip('\0').upper()
                     light, special, tag = s[4], s[5], s[6]
                     sector_rows.append((len(sector_rows), floor_h, ceil_h, floor_tex, ceil_tex, light, special, tag))
 
@@ -516,9 +614,9 @@ class DOOMHouse:
                 for i in range(0, len(sidedef_data), 30):
                     s = struct.unpack('<hh8s8s8sh', sidedef_data[i:i+30])
                     x_off, y_off = s[0], s[1]
-                    upper = s[2].decode('ascii').strip('\0')
-                    lower = s[3].decode('ascii').strip('\0')
-                    middle = s[4].decode('ascii').strip('\0')
+                    upper = s[2].decode('ascii').strip('\0').upper()
+                    lower = s[3].decode('ascii').strip('\0').upper()
+                    middle = s[4].decode('ascii').strip('\0').upper()
                     sector_id = s[5]
                     sidedef_rows.append((len(sidedef_rows), x_off, y_off, upper, lower, middle, sector_id))
 
@@ -560,27 +658,11 @@ class DOOMHouse:
                 # 10. Insert into DB
                 print("📐 Populating WAD tables into ClickHouse...")
                 
-                def insert_rows(table, rows, columns):
-                    if not rows: return
-                    if USE_CHDB:
-                        # Batch insert for performance
-                        batch_size = 5000
-                        for i in range(0, len(rows), batch_size):
-                            batch = rows[i:i+batch_size]
-                            # Format values based on type
-                            values = []
-                            for row in batch:
-                                row_vals = []
-                                for val in row:
-                                    if isinstance(val, str):
-                                        row_vals.append(f"'{val}'")
-                                    else:
-                                        row_vals.append(str(val))
-                                values.append(f"({','.join(row_vals)})")
-                            self.db_client.query(f"INSERT INTO doomhouse.{table} ({columns}) VALUES {','.join(values)}")
-                    else:
-                        self.db_client.insert(f'doomhouse.{table}', rows)
-
+                # Re-define insert_rows here to use the one defined above or just use the one above?
+                # The one above is inside initialize_game_data scope, so it's fine.
+                # But I need to make sure I don't shadow it or duplicate logic unnecessarily.
+                # I'll just reuse the logic.
+                
                 insert_rows('wad_vertexes', vertex_rows, 'id, x, y')
                 insert_rows('wad_sectors', sector_rows, 'id, floor_h, ceil_h, floor_tex, ceil_tex, light, special, tag')
                 insert_rows('wad_sidedefs', sidedef_rows, 'id, x_off, y_off, upper, lower, middle, sector_id')
@@ -604,28 +686,32 @@ class DOOMHouse:
     def _initialize_fallback_data(self):
         """Populate BSP segments with a simple square room as fallback."""
         print("📐 Populating fallback BSP segments...")
+        # id, x1, y1, x2, y2, ceil, floor, wall_tex, ceil_tex, floor_tex, wall_tex_id, ceil_tex_id, floor_tex_id, light, sector_id, seg_offset, tex_x_off, tex_y_off, length
         segments = [
-            # id, x1, y1, x2, y2, ceil, floor
-            [1, 1.0, 1.0, 8.0, 1.0, 1.0, 0.0], # North Wall
-            [2, 8.0, 1.0, 8.0, 8.0, 1.0, 0.0], # East Wall
-            [3, 8.0, 8.0, 1.0, 8.0, 1.0, 0.0], # South Wall
-            [4, 1.0, 8.0, 1.0, 1.0, 1.0, 0.0], # West Wall
-            
-            # Add some internal pillars
-            [5, 3.0, 3.0, 4.0, 3.0, 1.0, 0.0],
-            [6, 4.0, 3.0, 4.0, 4.0, 1.0, 0.0],
-            [7, 4.0, 4.0, 3.0, 4.0, 1.0, 0.0],
-            [8, 3.0, 4.0, 3.0, 3.0, 1.0, 0.0]
+            [1, 1.0, 1.0, 8.0, 1.0, 1.0, 0.0, 'WALL', 'CEIL', 'FLOOR', 1, 1, 1, 200, 1, 0.0, 0.0, 0.0, 7.0],
+            [2, 8.0, 1.0, 8.0, 8.0, 1.0, 0.0, 'WALL', 'CEIL', 'FLOOR', 1, 1, 1, 200, 1, 0.0, 0.0, 0.0, 7.0],
+            [3, 8.0, 8.0, 1.0, 8.0, 1.0, 0.0, 'WALL', 'CEIL', 'FLOOR', 1, 1, 1, 200, 1, 0.0, 0.0, 0.0, 7.0],
+            [4, 1.0, 8.0, 1.0, 1.0, 1.0, 0.0, 'WALL', 'CEIL', 'FLOOR', 1, 1, 1, 200, 1, 0.0, 0.0, 0.0, 7.0]
         ]
+        
+        columns = "id, x1, y1, x2, y2, ceil, floor, wall_tex, ceil_tex, floor_tex, wall_tex_id, ceil_tex_id, floor_tex_id, light, sector_id, seg_offset, tex_x_off, tex_y_off, length"
         
         try:
             if USE_CHDB:
-                values = [f"({s[0]},{s[1]},{s[2]},{s[3]},{s[4]},{s[5]},{s[6]})" for s in segments]
-                self.db_client.query(f"INSERT INTO doomhouse.bsp_source (id, x1, y1, x2, y2, ceil, floor) VALUES {','.join(values)}")
+                values = []
+                for s in segments:
+                    row = []
+                    for val in s:
+                        if isinstance(val, str):
+                            row.append(f"'{val}'")
+                        else:
+                            row.append(str(val))
+                    values.append(f"({','.join(row)})")
+                self.db_client.query(f"INSERT INTO doomhouse.bsp_resolved ({columns}) VALUES {','.join(values)}")
             else:
-                self.db_client.insert('doomhouse.bsp_source', segments)
+                self.db_client.insert('doomhouse.bsp_resolved', segments)
             
-            self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_segs")
+            self._db_command("SYSTEM RELOAD DICTIONARY doomhouse.dict_bsp_resolved")
         except Exception as e:
             print(f"Error populating fallback BSP segments: {e}")
 

@@ -13,8 +13,18 @@ SELECT
     sec.ceil_tex AS ceil_tex,
     sec.floor_tex AS floor_tex,
     
+    -- Resolve Texture IDs
+    dictGet('doomhouse.dict_wad_texture_name_to_id', 'id', sd.middle) AS wall_tex_id,
+    dictGet('doomhouse.dict_wad_texture_name_to_id', 'id', sec.ceil_tex) AS ceil_tex_id,
+    dictGet('doomhouse.dict_wad_texture_name_to_id', 'id', sec.floor_tex) AS floor_tex_id,
+    
     sec.light AS light,
-    sec.id AS sector_id
+    sec.id AS sector_id,
+    
+    s.offset AS seg_offset,
+    sd.x_off AS tex_x_off,
+    sd.y_off AS tex_y_off,
+    sqrt(pow(v2.x * 0.01 - v1.x * 0.01, 2) + pow(v2.y * 0.01 - v1.y * 0.01, 2)) AS length
 
 FROM doomhouse.wad_segs AS s
 LEFT JOIN doomhouse.wad_vertexes AS v1 ON s.v1 = v1.id

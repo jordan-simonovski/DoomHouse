@@ -47,8 +47,16 @@ CREATE TABLE IF NOT EXISTS doomhouse.tex_wall2_source (id UInt32, r UInt8, g UIn
 CREATE TABLE IF NOT EXISTS doomhouse.tex_floor_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
 CREATE TABLE IF NOT EXISTS doomhouse.tex_ceiling_source (id UInt32, r UInt8, g UInt8, b UInt8) ENGINE = MergeTree ORDER BY id;
 
--- 4. BSP Segment Source (Replaced by WAD tables)
--- CREATE TABLE IF NOT EXISTS doomhouse.bsp_source ...
+-- 4. BSP Segment Source (Fallback)
+CREATE TABLE IF NOT EXISTS doomhouse.bsp_source (
+    id UInt32,
+    x1 Float64,
+    y1 Float64,
+    x2 Float64,
+    y2 Float64,
+    ceil Float32,
+    floor Float32
+) ENGINE = MergeTree ORDER BY id;
 
 -- 5. Raw WAD Tables
 CREATE TABLE IF NOT EXISTS doomhouse.wad_vertexes (
@@ -120,6 +128,13 @@ CREATE TABLE IF NOT EXISTS doomhouse.bsp_resolved (
     wall_tex String,
     ceil_tex String,
     floor_tex String,
+    wall_tex_id UInt32,
+    ceil_tex_id UInt32,
+    floor_tex_id UInt32,
     light UInt8,
-    sector_id UInt16
+    sector_id UInt16,
+    seg_offset Float32,
+    tex_x_off Float32,
+    tex_y_off Float32,
+    length Float32
 ) ENGINE = MergeTree ORDER BY id;

@@ -21,8 +21,15 @@ CREATE DICTIONARY doomhouse.dict_bsp_resolved (
     wall_tex String,
     ceil_tex String,
     floor_tex String,
+    wall_tex_id UInt32,
+    ceil_tex_id UInt32,
+    floor_tex_id UInt32,
     light UInt8,
-    sector_id UInt16
+    sector_id UInt16,
+    seg_offset Float32,
+    tex_x_off Float32,
+    tex_y_off Float32,
+    length Float32
 )
 PRIMARY KEY id
 SOURCE(CLICKHOUSE(TABLE 'bsp_resolved' DB 'doomhouse'))
