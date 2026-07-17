@@ -13,7 +13,7 @@ fork and compare frame rates on your own hardware.
 | Frame table engine | `Memory` | `MergeTree` (required by `STREAM`) |
 | fps\* | ~8 | ~31 |
 
-\* From the recordings in [../screen_recording/](../screen_recording/); read the
+\* From the demo clips in the [main README](../README.md#demo); read the
 on-screen counter, and expect different numbers on your hardware.
 
 The renderer SQL (raycasting + blur) is identical; only *how work is triggered and

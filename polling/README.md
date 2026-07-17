@@ -18,8 +18,8 @@ There are three engines in this repo, differing along two independent axes —
 | `polling/` (this dir) | **concurrent** query templates (~31ms) | polled `SELECT` | ~16 |
 | [`src/`](../src) (streaming) | **concurrent** query templates (~20ms) | `SELECT ... STREAM` | ~31 |
 
-\* Read off the on-screen counter in the recordings in
-[`../screen_recording/`](../screen_recording/); your hardware will differ.
+\* Read off the on-screen counter in the demo clips in the
+[main README](../README.md#demo); your hardware will differ.
 
 Each step roughly doubles the frame rate, for a *different* reason:
 

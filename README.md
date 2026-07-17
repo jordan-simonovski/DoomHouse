@@ -44,18 +44,15 @@ on-screen counter in each clip.)
 
 **Original — sequential materialized-view render (~8fps):**
 
-https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doomhouse_non-_streaming.mp4
+https://github.com/user-attachments/assets/472ed0dc-9c29-452c-ad20-441c8d4708d4
 
 **Concurrent render, polled delivery (~16fps):**
 
-https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doom_polling.mp4
+https://github.com/user-attachments/assets/1b4dc733-1c1d-4006-bdb6-5d6f789dea75
 
 **This fork — concurrent render + streaming delivery (~31fps):**
 
-https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doomhouse_streaming.mp4
-
-> If the players don't render inline, click through to
-> [`screen_recording/`](screen_recording/).
+https://github.com/user-attachments/assets/689fba6e-d25c-4782-907c-8107ed144657
 
 ## Prerequisites
 
@@ -124,9 +121,8 @@ so all three run at once:
 | [`polling/`](polling/) | **concurrent** query templates (~31ms) | polled `SELECT` (UI thread deserializes) | ~16 |
 | `src/` (this fork) | **concurrent** query templates (~20ms) | `SELECT ... STREAM` (parsed off-thread) | ~31 |
 
-\* Read off the on-screen counter in the recordings in
-[`screen_recording/`](screen_recording/); your hardware will differ, so run them
-and read your own counter.
+\* Read off the on-screen counter in the [demo clips](#demo) above; your hardware
+will differ, so run them and read your own counter.
 
 Each change roughly **doubles** the frame rate, for a different reason:
 

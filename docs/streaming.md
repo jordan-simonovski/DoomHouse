@@ -115,9 +115,9 @@ blits the 640×480 image.
 
 ## Performance: how ~8fps became ~31fps
 
-Measured on an 18-core machine, fps read off the on-screen counter in the
-recordings in [`../screen_recording/`](../screen_recording/). The three engines
-isolate the two variables:
+Measured on an 18-core machine, fps read off the on-screen counter in the demo
+clips in the [README](../README.md#demo). The three engines isolate the two
+variables:
 
 | Engine | Render | Delivery | fps |
 |---|---|---|---|
