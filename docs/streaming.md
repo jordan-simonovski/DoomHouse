@@ -4,7 +4,7 @@ This fork replaces DOOMHouse's request/response render loop with **continuous
 queries** — ClickHouse's `SELECT ... STREAM` feature (26.6+) — so rendered frames
 are *pushed* to the client as soon as they exist, and reworks the render pipeline
 so the four screen quarters render **concurrently**. Net result on an 18-core
-box: **~8fps → ~19fps**, with no frame tearing.
+box: **~8fps → ~31fps**, with no frame tearing.
 
 This document is the engineering log: the architecture, what's stored in the
 database, what gets streamed, and every hiccup worth knowing. It doubles as
@@ -113,15 +113,28 @@ the latest quarter per stream keyed by `frame_id`; when all four quarters share 
 `frame_id`, it slices off the overlap rows, concatenates the four arrays, and
 blits the 640×480 image.
 
-## Performance: how ~8fps became ~19fps
+## Performance: how ~8fps became ~31fps
 
-Streaming alone did **not** raise the frame rate — and that's expected. Streaming
-changes *delivery*, not *compute*. The frame still had to be rendered. Measuring
-where the time went was the whole game:
+Measured on an 18-core machine, fps read off the on-screen counter in the
+recordings in [`../screen_recording/`](../screen_recording/). The three engines
+isolate the two variables:
+
+| Engine | Render | Delivery | fps |
+|---|---|---|---|
+| non-streaming (original) | sequential MVs, ~100ms, 1 thread | polled `SELECT` | ~8 |
+| polling | concurrent render, ~31ms | polled `SELECT` (UI-thread deserialize) | ~16 |
+| streaming | concurrent render, ~20ms | `STREAM`, parsed off-thread | ~31 |
+
+Each change roughly doubles the frame rate — **concurrent rendering** takes
+~8 → ~16 (it uses the idle cores), and **streaming delivery** takes ~16 → ~31
+(polling stalls the UI thread deserializing each frame's pixel arrays; streaming
+parses off-thread and paints async). So streaming is a genuine throughput win
+here, not just smoothing — a surprise, since streaming changes *delivery*, not
+*compute*. Where the render time itself went:
 
 | Stage | Cost | Note |
 |---|---|---|
-| Original full render (INSERT firing all MVs) | ~125 ms | single-threaded! ~0.6 of 18 cores |
+| Original full render (INSERT firing all MVs) | ~100–125 ms | single-threaded! ~0.6 of 18 cores |
 | One quarter's raycast (standalone `SELECT`) | ~15 ms | |
 | 4 quarter renders, **serial** | ~64 ms | |
 | 4 quarter renders, **concurrent** | **~20 ms** | ~3–4 cores — the unlock |
@@ -151,9 +164,8 @@ measurement:
 
 3. **Parse with numpy.** With rendering at ~20ms, the client became the limit:
    four threads parsing ~78k integers each via `int()` saturated the GIL.
-   `numpy.fromstring(sep=',')` is ~4× faster and holds the GIL far less, which
-   also unblocked the dispatch threads. This took the in-game result from ~16 to
-   ~19fps.
+   `numpy.fromstring(sep=',')` is ~4× faster and holds the GIL for less wall-time,
+   which unblocks the other stream threads sooner.
 
 Movement is applied per frame, so ~2.4×-ing the frame rate made the player move
 ~2.4× faster — the movement constants were scaled down to compensate.

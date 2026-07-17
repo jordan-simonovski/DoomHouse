@@ -21,29 +21,36 @@ The original engine used a request/response loop: insert an input, then block on
 `SELECT`s to pull the frame back. This fork instead treats each rendered frame as
 an event on a live stream:
 
-- **`SELECT ... STREAM` continuous queries** (ClickHouse 26.6+) tail the frame
-  tables and *push* each new frame to the client the moment it lands — no polling,
-  no per-frame query setup.
 - **Concurrent rendering.** The screen is split into four quarters, each rendered
   by its own query dispatched in parallel, so rendering uses many cores instead of
-  one. This is the bulk of the speed-up.
+  the single thread ClickHouse gives a sequential materialized-view chain. This is
+  where most of the speed-up comes from.
+- **`SELECT ... STREAM` continuous queries** (ClickHouse 26.6+) tail the frame
+  tables and *push* each new frame to the client the moment it lands — no polling,
+  no per-frame query setup, and the pixel parsing happens off the UI thread.
 - **A `frame_id` barrier** keeps the four independently-streamed quarters coherent,
   so frames never tear across the seam.
 
-On an 18-core machine this took the engine from **~8fps to ~30fps**. See the
-[side-by-side comparison](#side-by-side-non-streaming-vs-streaming) to feel the
-difference, and [docs/streaming.md](docs/streaming.md) for the full engineering log
-(including every silent failure mode of a two-week-old ClickHouse feature).
+Frame rate is very machine- and display-dependent, so rather than quote numbers
+here: the [three engines](#side-by-side-three-engines-two-variables) below each
+show a live fps counter — run them on your hardware and compare. The
+[full engineering log](docs/streaming.md) covers what the migration took,
+including every silent failure mode of a two-week-old ClickHouse feature.
 
 ## Demo
 
-Same engine, same ClickHouse, same hardware — only the render loop differs.
+Same ClickHouse, same hardware — only the render loop differs. (fps read off the
+on-screen counter in each clip.)
 
-**Original (non-streaming, ~6-8fps):**
+**Original — sequential materialized-view render (~8fps):**
 
 https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doomhouse_non-_streaming.mp4
 
-**This fork (streaming + concurrent render, ~30fps):**
+**Concurrent render, polled delivery (~16fps):**
+
+https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doom_polling.mp4
+
+**This fork — concurrent render + streaming delivery (~31fps):**
 
 https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doomhouse_streaming.mp4
 
@@ -61,11 +68,11 @@ Streaming queries (`SELECT ... STREAM` + `enable_streaming_queries`) require
 ## Quickstart
 
 ```bash
-docker compose up -d          # start ClickHouse 26.6+ (localhost only)
-uv run src/DOOMHouse.py        # uv installs deps on first run
+make db-up        # start ClickHouse 26.6+ (localhost only)
+make streaming    # run this fork (uv installs deps on first run)
 ```
 
-`docker compose down` stops ClickHouse. The compose file runs the server with a
+`make db-down` stops ClickHouse. The compose file runs the server with a
 passwordless `default` user bound to `127.0.0.1` — deliberate, because the game's
 texture/map dictionaries self-connect as `default` (see
 [docs/streaming.md](docs/streaming.md) for the why). Don't expose that port to an
@@ -84,9 +91,9 @@ CLICKHOUSE_PASS=
 
 ### Dependencies
 
-Managed by uv via `pyproject.toml` / `uv.lock` — `uv run` handles the virtualenv,
-so there's no separate install step (use `uv sync` to pre-install). The project
-uses:
+Managed by uv via `pyproject.toml` / `uv.lock` — the `make` run targets handle the
+virtualenv, so there's no separate install step (use `make sync` to pre-install).
+The project uses:
 
 - `clickhouse-connect` — ClickHouse client (streaming via `raw_stream`)
 - `Pillow` — texture loading and image blitting
@@ -104,27 +111,50 @@ uses:
 | T     | Switch theme |
 | Esc | Exit |
 
-## Side-by-side: non-streaming vs streaming
+## Side-by-side: three engines, two variables
 
-`non-streaming/` contains the original request/response engine, wired to the *same*
-ClickHouse (a separate `doomhouse_ns` database, so both can run at once). Run them
-together to compare frame rates on your hardware:
+The repo ships three engines so you can separate *what actually made it faster*
+from *what streaming adds*. They differ along two independent axes — how rendering
+is triggered, and how frames are delivered — each on its own ClickHouse database
+so all three run at once:
+
+| Engine | Render | Delivery | fps\* |
+|---|---|---|---|
+| [`non-streaming/`](non-streaming/) (original fork) | sequential materialized views (~100ms, one thread) | polled `SELECT` | ~8 |
+| [`polling/`](polling/) | **concurrent** query templates (~31ms) | polled `SELECT` (UI thread deserializes) | ~16 |
+| `src/` (this fork) | **concurrent** query templates (~20ms) | `SELECT ... STREAM` (parsed off-thread) | ~31 |
+
+\* Read off the on-screen counter in the recordings in
+[`screen_recording/`](screen_recording/); your hardware will differ, so run them
+and read your own counter.
+
+Each change roughly **doubles** the frame rate, for a different reason:
+
+- **non-streaming → polling** (rendering only): the original runs the four
+  quarter materialized views sequentially on one thread (~100ms/frame);
+  dispatching four independent render queries concurrently uses the idle cores
+  and cuts that to ~31ms.
+- **polling → streaming** (delivery only): request/response deserializes each
+  frame's pixel arrays synchronously on the UI thread and stalls it; streaming
+  pushes frames that are parsed off-thread and painted async, so the UI thread
+  keeps moving.
+
+See [`polling/README.md`](polling/README.md) and
+[docs/streaming.md](docs/streaming.md) for the full breakdown.
 
 ```bash
-docker compose up -d
-uv run non-streaming/DOOMHouse.py   # original polling + materialized-view engine
-uv run src/DOOMHouse.py             # this fork: streaming + concurrent render
+make non-streaming   # original: sequential MVs, polled
+make polling         # concurrent render, polled
+make streaming       # concurrent render, streamed (this fork)
 ```
-
-See [non-streaming/README.md](non-streaming/README.md) for details.
 
 ## End-to-end test (headless)
 
 Exercises the full streaming pipeline without opening a window:
 
 ```bash
-docker compose up -d
-uv run test_e2e.py
+make db-up
+make test
 ```
 
 ## Screen recording

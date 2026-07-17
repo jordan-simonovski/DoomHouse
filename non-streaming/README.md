@@ -8,14 +8,18 @@ fork and compare frame rates on your own hardware.
 
 | | non-streaming (this dir) | streaming (`src/`) |
 |---|---|---|
+| Rendering | materialized views fire **sequentially** on one INSERT (~100ms) | 4 quarter renders dispatched **concurrently** (~20ms) |
 | Frame delivery | client fires 4 blocking `SELECT`s per frame | 4 long-lived `SELECT ... STREAM` tails push frames |
-| Rendering | materialized views fire **sequentially** on one INSERT | 4 quarter renders dispatched **concurrently** |
 | Frame table engine | `Memory` | `MergeTree` (required by `STREAM`) |
-| Typical frame rate | ~6-8 fps | ~30 fps |
+| fps\* | ~8 | ~31 |
+
+\* From the recordings in [../screen_recording/](../screen_recording/); read the
+on-screen counter, and expect different numbers on your hardware.
 
 The renderer SQL (raycasting + blur) is identical; only *how work is triggered and
-frames are delivered* changes. The full story is in
-[../docs/streaming.md](../docs/streaming.md).
+frames are delivered* changes. For the middle step that isolates each variable —
+concurrent render with plain polling (~16fps) — see [`../polling`](../polling).
+The full story is in [../docs/streaming.md](../docs/streaming.md).
 
 ## Running
 
@@ -23,15 +27,16 @@ It uses a **separate ClickHouse database (`doomhouse_ns`)**, so it can run at th
 same time as the streaming version against the same server without clashing:
 
 ```bash
-docker compose up -d          # from the repo root — same ClickHouse for both
-uv run non-streaming/DOOMHouse.py
+make db-up            # from the repo root — same ClickHouse for all engines
+make non-streaming
 ```
 
-Run both at once to compare:
+Run them side by side to compare:
 
 ```bash
-uv run non-streaming/DOOMHouse.py   # window titled "... (NON-STREAMING) ..."
-uv run src/DOOMHouse.py             # the streaming fork
+make non-streaming   # window titled "... (NON-STREAMING) ..."
+make polling         # concurrent render, polled
+make streaming       # the streaming fork
 ```
 
 Both read textures/images from the repo root, so launch from the repo root (not
