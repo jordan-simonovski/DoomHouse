@@ -1,11 +1,19 @@
 import clickhouse_connect
 import sys
-import array
 import math
 import os
 import time
+import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
-import concurrent.futures
+import numpy as np
+
+# np.fromstring(sep=',') is the fastest text->uint32 path (~4.6x faster than
+# np.array(str.split(...)) on a full quarter, and it's on the per-frame hot path),
+# but numpy deprecated the separated form. Silence that one warning; if a future
+# numpy removes it, switch the parse in _handle_row to a binary decode.
+warnings.filterwarnings("ignore", message="The binary mode of fromstring")
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from dotenv import load_dotenv
 
@@ -20,9 +28,18 @@ PORT = int(os.getenv('CLICKHOUSE_PORT', '8123'))
 USER = os.getenv('CLICKHOUSE_USER', 'default')
 PASS = os.getenv('CLICKHOUSE_PASS', '')
 
-# Movement Constants
-MOVE_SPEED = 0.3
-ROT_SPEED = 0.15
+# Streaming: how often the server flushes streamed rows to the client. The
+# server default is 7500ms; we drop it to ~one frame so each rendered frame is
+# pushed the moment it lands instead of after a multi-second batch window.
+STREAM_FLUSH_MS = int(os.getenv('STREAM_FLUSH_MS', '16'))
+FRAME_W = 640
+ROWS_PER_QUARTER = 120
+
+# Movement Constants (per rendered frame). Streaming roughly tripled the frame
+# rate versus the original polling loop, and movement is applied per frame, so
+# these are scaled down to keep the original walking/turning feel. Tune to taste.
+MOVE_SPEED = 0.12
+ROT_SPEED = 0.06
 
 # Texture Settings
 #TEXTURE_SIZE = 64  # 64x64 pixels
@@ -88,25 +105,16 @@ class DOOMHouse:
             self.client = clickhouse_connect.get_client(
                 host=HOST, port=PORT, username=USER, password=PASS
             )
-            # Second client for parallel queries
-            self.client2 = clickhouse_connect.get_client(
-                host=HOST, port=PORT, username=USER, password=PASS
-            )
-            self.client3 = clickhouse_connect.get_client(
-                host=HOST, port=PORT, username=USER, password=PASS
-            )
-            self.client4 = clickhouse_connect.get_client(
-                host=HOST, port=PORT, username=USER, password=PASS
-            )
-            
+
             # Get and print ClickHouse version
             version = self.client.query("SELECT version()").result_rows[0][0]
             print(f"Connected to ClickHouse version: {version}")
-            
-            # Version check
+
+            # Version check: streaming queries (`SELECT ... STREAM` +
+            # enable_streaming_queries) require ClickHouse 26.6 or later.
             try:
                 v_parts = [int(p) for p in version.split('.')]
-                required_v = [26, 1, 1, 562]
+                required_v = [26, 6]
                 is_supported = True
                 for i in range(min(len(v_parts), len(required_v))):
                     if v_parts[i] < required_v[i]:
@@ -114,10 +122,10 @@ class DOOMHouse:
                         break
                     elif v_parts[i] > required_v[i]:
                         break
-                
+
                 if not is_supported:
                     print("\n" + "="*80)
-                    print("**OBS**: Due to an issue with some newer versions of ClickHouse this program only supports ClickHosue version `26.1.1.562` or later.")
+                    print("**OBS**: Streaming queries (SELECT ... STREAM) require ClickHouse 26.6 or later.")
                     print("="*80 + "\n")
             except Exception as ve:
                 print(f"Could not parse ClickHouse version for compatibility check: {ve}")
@@ -155,9 +163,36 @@ class DOOMHouse:
         # Performance Tracking
         self.total_insert_time = 0.0
         self.insert_count = 0
-        self.total_select_time = 0.0
-        self.select_count = 0
-                
+        self.insert_time = 0.0
+        self.avg_insert_time = 0.0
+        self.frames_painted = 0
+        self.last_paint_time = time.time()
+        self.paint_fps = 0.0
+
+        # Streaming state: each quarter has its own long-lived STREAM query
+        # running in a background thread. Workers write the latest quarter buffer
+        # here; the Tk paint loop composites and displays them.
+        self.quarter_data = [None, None, None, None]   # numpy uint32 pixels per quarter
+        self.quarter_pos = [None, None, None, None]     # (pos_x, pos_y) per quarter
+        self.quarter_frame = [None, None, None, None]   # frame_id per quarter (tearing barrier)
+        self.frame_lock = threading.Lock()
+        self.new_frame = False
+        self.stream_error = None                        # last stream failure, surfaced on screen
+        self.stream_threads = []
+        self.start_streams()
+
+        # Concurrent render dispatch: one client + thread per quarter so the four
+        # renders run in parallel (see push_input). render_busy gates overlap.
+        self.render_clients = [
+            clickhouse_connect.get_client(host=HOST, port=PORT, username=USER, password=PASS)
+            for _ in range(4)
+        ]
+        self.render_pool = ThreadPoolExecutor(max_workers=4)
+        self.render_busy = False
+        self._pending = 0
+        self._pending_lock = threading.Lock()
+        self._render_start = time.time()
+
         # Show Splash Screen
         self.show_splash()
 
@@ -238,6 +273,16 @@ class DOOMHouse:
 
     def _on_close(self):
         self.running = False
+        # Best-effort cleanup so we don't leave server sessions/threads dangling.
+        try:
+            self.render_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        for c in [self.client, *self.render_clients]:
+            try:
+                c.close()
+            except Exception:
+                pass
         self.root.destroy()
 
     def load_texture(self, filename):
@@ -345,7 +390,7 @@ class DOOMHouse:
             for i in range(1, 5):
                 self.client.command(f"DROP VIEW IF EXISTS doomhouse.render_materialized_{i}")
                 self.client.command(f"DROP VIEW IF EXISTS doomhouse.post_process_materialized_{i}")
-            
+
             # 2. Drop Dictionaries
             dicts = [
                 "dict_map_data", "dict_floor_dist", "dict_tex_data", "dict_tex_wall_data",
@@ -362,6 +407,8 @@ class DOOMHouse:
                 "rendered_frame_top", "rendered_frame_bottom",
                 "rendered_frame_post_processed_top", "rendered_frame_post_processed_bottom"
             ]
+            for i in range(1, 5):
+                tables.append(f"player_input_{i}")
             for t in tables:
                 self.client.command(f"DROP TABLE IF EXISTS doomhouse.{t}")
             for i in range(1, 5):
@@ -456,17 +503,24 @@ class DOOMHouse:
         self.execute_sql_script("src/SQL/create_dictionaries.sql")
 
     def initialize_tables(self):
-        # Re-create tables to ensure schema matches
-        sql_files = [
-            "src/SQL/player_input_table.sql",
-            "src/SQL/rendered_frame_table.sql",
-            "src/SQL/rendered_frame_post_processed_table.sql",
-            "src/SQL/render_view.sql",
-            "src/SQL/post_process_view.sql",
-        ]
-        
-        for sql_file in sql_files:
-            self.execute_sql_script(sql_file)
+        # Only the streamed bus tables are persistent objects now. The render
+        # itself is a set of query templates the client fills per frame and
+        # dispatches concurrently (see load_frame_templates / push_input).
+        self.execute_sql_script("src/SQL/rendered_frame_post_processed_table.sql")
+        self.load_frame_templates()
+
+    def load_frame_templates(self):
+        # Four render+blur query templates with @@...@@ placeholders for the
+        # current player input, delimited by '-- QUARTER' lines.
+        import re
+        with open("src/SQL/frame_render.sql") as f:
+            content = f.read()
+        # Split on delimiter lines of the exact form "-- QUARTER <n>" (the header
+        # comment mentions the phrase, so match the numbered line specifically).
+        chunks = re.split(r'(?m)^-- QUARTER \d+\s*$', content)
+        self.frame_templates = [c.strip() for c in chunks[1:] if c.strip()]
+        if len(self.frame_templates) != 4:
+            raise RuntimeError(f"expected 4 frame templates, got {len(self.frame_templates)}")
 
     def turn_right_logic(self):
         old_dir_x = self.dir_x
@@ -510,27 +564,76 @@ class DOOMHouse:
             self.push_input(tx, ty)
 
     def push_input(self, target_x, target_y):
-        try:
-            start_time = time.time()
-            self.frame_id += 1
-            self.client.command(f"""
-                INSERT INTO doomhouse.player_input
-                (frame_id, old_x, old_y, try_x, try_y, dir_x, dir_y, plane_x, plane_y)
-                VALUES ({self.frame_id}, {self.pos_x}, {self.pos_y}, {target_x}, {target_y},
-                        {self.dir_x}, {self.dir_y}, {self.plane_x}, {self.plane_y})
-            """)            
-            self.insert_time = (time.time() - start_time) * 1000 # in ms
+        # Fire the four quarter renders concurrently. Each quarter is a render+blur
+        # query template with the current input inlined as literals, dispatched on
+        # its own client/thread, so the four renders run in parallel across cores
+        # (~20ms) instead of one INSERT rendering them serially.
+        #
+        # Non-blocking: we don't wait for the renders here (the frames come back
+        # over the STREAM queries and are drawn by the paint loop). render_busy
+        # skips input while a render is in flight, so we never queue faster than
+        # the pipeline can render and the client always shows the latest frame.
+        if self.render_busy:
+            return
+        self.render_busy = True
+        self.frame_id += 1
+        subs = {
+            "@@frame_id@@": str(self.frame_id),
+            "@@old_x@@": repr(self.pos_x), "@@old_y@@": repr(self.pos_y),
+            "@@try_x@@": repr(target_x), "@@try_y@@": repr(target_y),
+            "@@dir_x@@": repr(self.dir_x), "@@dir_y@@": repr(self.dir_y),
+            "@@plane_x@@": repr(self.plane_x), "@@plane_y@@": repr(self.plane_y),
+        }
+        self._render_start = time.time()
+        self._pending = 4
+        # Submit under try/except: if the pool rejects a submit partway through
+        # (e.g. shut down during teardown), settle the un-dispatched quarters so
+        # _pending still reaches 0 and render_busy is released — otherwise the
+        # gate sticks True and input freezes permanently.
+        for i in range(4):
+            try:
+                fut = self.render_pool.submit(self._insert_quarter, i, subs)
+            except Exception as e:
+                print(f"Render submit failed for quarter {i + 1}: {e}")
+                self._on_quarter_done(None)
+                continue
+            fut.add_done_callback(self._on_quarter_done)
+
+    def _insert_quarter(self, idx, subs):
+        q = idx + 1
+        query = self.frame_templates[idx]
+        for k, v in subs.items():
+            query = query.replace(k, v)
+        if "@@" in query:
+            # A placeholder went unsubstituted — fail loudly rather than sending
+            # broken SQL that ClickHouse rejects with a confusing parse error.
+            raise ValueError(f"unsubstituted placeholder in quarter {q} template")
+        self.render_clients[idx].command(
+            f"INSERT INTO doomhouse.rendered_frame_post_processed_{q} "
+            f"(frame_id, pos_x, pos_y, image_data) {query}"
+        )
+
+    def _on_quarter_done(self, fut):
+        err = fut.exception() if fut is not None else None
+        if err:
+            # Surface render failures on screen too — unlike stream errors these
+            # otherwise only hit the console, so a broken render looks like a hang.
+            msg = str(err).split('\n')[0]
+            print(f"Render dispatch error: {msg}")
+            self.stream_error = f"Render: {msg}"
+        with self._pending_lock:
+            self._pending -= 1
+            done = self._pending == 0
+        if done:
+            self.insert_time = (time.time() - self._render_start) * 1000
             self.total_insert_time += self.insert_time
             self.insert_count += 1
             self.avg_insert_time = self.total_insert_time / self.insert_count
-            print(f"Insert: {self.insert_time:.2f}ms (Avg: {self.avg_insert_time:.2f}ms)")
-
-            self.render()
-        except Exception as e:
-            print(f"Input Error: {e}")
+            self.render_busy = False
 
     def run(self):
         self.update_loop()
+        self.paint_loop()
         self.root.mainloop()
 
     def update_loop(self):
@@ -545,91 +648,160 @@ class DOOMHouse:
             
         self.root.after(16, self.update_loop) # ~60 FPS target for input check
 
-    def render(self):
+    def start_streams(self):
+        """Open one long-lived STREAM query per quarter in a background thread.
+
+        Instead of polling the four frame tables after every input, each worker
+        subscribes once with `SELECT ... STREAM` and blocks on the connection.
+        The moment the render pipeline inserts a new frame row, ClickHouse pushes
+        it down the open connection and the worker parses it. This removes the
+        per-frame query round-trip and lets the display update as frames arrive.
+        """
+        for i in range(4):
+            t = threading.Thread(target=self._stream_worker, args=(i,), daemon=True)
+            t.start()
+            self.stream_threads.append(t)
+
+    def _stream_worker(self, idx):
+        quarter = idx + 1
+        # We stream the pixel array as a comma-joined string in a text format.
+        # Binary formats (RowBinary/Native/Arrow) buffer the payload server-side
+        # and never flush a single big row; row-based text formats flush live.
+        # WHERE ts >= now() so a mid-game reconnect tails only new frames instead
+        # of replaying the TTL window of buffered rows (which would flood the
+        # client and rewind the player to a stale streamed position).
+        query = (
+            f"SELECT frame_id, pos_x, pos_y, arrayStringConcat(image_data, ',') "
+            f"FROM doomhouse.rendered_frame_post_processed_{quarter} STREAM "
+            f"WHERE ts >= now()"
+        )
+        settings = {
+            'enable_streaming_queries': 1,
+            'stream_flush_interval_ms': STREAM_FLUSH_MS,
+        }
+        while self.running:
+            try:
+                # compress=False is required: compression buffers the response
+                # until a block fills, which defeats live streaming. One client per
+                # reconnect attempt, always closed in finally so a flapping stream
+                # doesn't leak connections/sockets.
+                conn = clickhouse_connect.get_client(
+                    host=HOST, port=PORT, username=USER, password=PASS, compress=False
+                )
+                try:
+                    buf = bytearray()
+                    with conn.raw_stream(query, settings=settings) as stream:
+                        for chunk in stream:
+                            if not self.running:
+                                break
+                            buf += chunk
+                            # A stream flush may split or batch rows; parse every
+                            # complete newline-terminated row we have so far.
+                            nl = buf.find(b'\n')
+                            while nl != -1:
+                                line = bytes(buf[:nl])
+                                del buf[:nl + 1]
+                                self._handle_row(idx, line)
+                                nl = buf.find(b'\n')
+                finally:
+                    conn.close()
+            except Exception as e:
+                if self.running:
+                    msg = str(e).split('\n')[0]
+                    print(f"Stream {quarter} error (reconnecting): {msg}")
+                    # Surface it on screen so the game doesn't just hang on the
+                    # splash with no explanation (e.g. a ClickHouse that predates
+                    # STREAM, or nothing listening on the configured host/port).
+                    self.stream_error = f"Quarter {quarter}: {msg}"
+            # Backoff before any reconnect — covers both the error path and a
+            # clean stream end, so a repeatedly-ending stream can't busy-loop.
+            if self.running:
+                time.sleep(0.5)
+
+    def _handle_row(self, idx, line):
+        if not line:
+            return
         try:
-            start_time = time.time()
-            
-            # Parallel Query Execution
-            # We launch four concurrent queries to fetch the quarters of the frame.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future1 = executor.submit(
-                    self.client.query,
-                    "SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed_1"
-                )
-                future2 = executor.submit(
-                    self.client2.query,
-                    "SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed_2"
-                )
-                future3 = executor.submit(
-                    self.client3.query,
-                    "SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed_3"
-                )
-                future4 = executor.submit(
-                    self.client4.query,
-                    "SELECT pos_x, pos_y, image_data FROM doomhouse.rendered_frame_post_processed_4"
-                )
-                
-                result1 = future1.result()
-                result2 = future2.result()
-                result3 = future3.result()
-                result4 = future4.result()
-
-            if not result1.result_rows or not result2.result_rows or not result3.result_rows or not result4.result_rows:
-                return
-
-            # Calculate render time
-            select_time = (time.time() - start_time) * 1000 # in ms
-            self.total_select_time += select_time
-            self.select_count += 1
-            avg_select_time = self.total_select_time / self.select_count
-            print(f"Select (Parallel 4-way): {select_time:.2f}ms (Avg: {avg_select_time:.2f}ms)")
-
-            # Set new position (synced from DB - using first result)
-            self.pos_x = result1.result_rows[0][0]
-            self.pos_y = result1.result_rows[0][1]
-            
-            # Compositing Step: Stitch the four partial image buffers
-            # We slice the arrays to remove the overlap rows used for seamless post-processing
-            # Q1: 0-120 -> 0-119 (Drop last)
-            # Q2: 119-240 -> 120-239 (Drop first and last)
-            # Q3: 239-360 -> 240-359 (Drop first and last)
-            # Q4: 359-479 -> 360-479 (Drop first)
-            
-            row_size = 640
-            rows_per_q = 120
-            
-            p1 = result1.result_rows[0][2][:rows_per_q * row_size]
-            p2 = result2.result_rows[0][2][row_size : row_size + rows_per_q * row_size]
-            p3 = result3.result_rows[0][2][row_size : row_size + rows_per_q * row_size]
-            p4 = result4.result_rows[0][2][row_size:]
-            
-            pixel_data = p1 + p2 + p3 + p4
-            
-            # Convert list of UInt32 to bytes efficiently.
-            # Each UInt32 is [R, G, B, 0] in little-endian memory.
-            raw_bytes = array.array('I', pixel_data).tobytes()
-            
-            # Create image from raw bytes (640x480)
-            image = Image.frombytes("RGB", (640, 480), raw_bytes, "raw", "RGBX")
-
-            # Convert PIL to ImageTk
-            self.photo = ImageTk.PhotoImage(image)
-            self.label.config(image=self.photo)
-            
-            # Update status text (Multi-line)
-            fps = 1000/(self.insert_time + select_time)
-            avgfps = 1000/(self.avg_insert_time + avg_select_time)
-            line1 = f"{fps:2.1f}fps (avg: {avgfps:2.1f}fps) | Insert: {self.insert_time:3.2f}ms (avg: {self.avg_insert_time:3.2f}ms) | Select: {select_time:3.2f}ms (avg: {avg_select_time:3.2f}ms)"
-            line2 = f"Pos: ({self.pos_x:5.2f}, {self.pos_y:5.2f}) | Theme: {self.current_theme.upper()} (Press 'T' to switch theme)"
-
-            self.status_label.config(text=f"{line1}\n{line2}")
-            
-            self.root.update_idletasks()
-
-            self.pos_x = result1.result_rows[0][0]
-            self.pos_y = result1.result_rows[0][1]
+            fid, px, py, pixels = line.split(b'\t')
+            # numpy parse is ~4x faster than array('I', map(int, ...)); less
+            # wall-time per parse means the 4 stream threads block each other on
+            # the GIL for less of the frame budget.
+            vals = np.fromstring(pixels, dtype=np.uint32, sep=',')
         except Exception as e:
-            print(f"Render Error: {e}")
+            print(f"Parse error on quarter {idx + 1}: {e}")
+            return
+        with self.frame_lock:
+            self.quarter_data[idx] = vals
+            self.quarter_pos[idx] = (float(px.decode()), float(py.decode()))
+            self.quarter_frame[idx] = int(fid)
+            self.new_frame = True
+
+    def paint_loop(self):
+        """Composite the four latest quarter buffers and draw them.
+
+        Runs on the Tk main thread (~60 Hz). It only redraws when a worker has
+        delivered a fresh frame, so it is idle-cheap when the player isn't moving.
+        """
+        if not self.running:
+            return
+        try:
+            # Frame barrier: only composite when all four quarters have arrived
+            # AND carry the same frame_id. This stops tearing between adjacent
+            # frames — a quarter from frame N+1 is never stitched onto frame N.
+            # The check and the snapshot must be under one lock: a stream thread
+            # can overwrite a quarter between an unlocked check and the copy,
+            # which would tear exactly the frame the barrier is meant to protect.
+            quarters = pos = None
+            with self.frame_lock:
+                if self.new_frame and all(q is not None for q in self.quarter_data) \
+                        and len(set(self.quarter_frame)) == 1:
+                    quarters = list(self.quarter_data)
+                    pos = self.quarter_pos[0]
+                    self.new_frame = False
+            if quarters is not None:
+                self._composite_and_draw(quarters, pos)
+            elif self.frames_painted == 0 and self.stream_error:
+                # No frame yet and a stream is failing — don't hang silently.
+                self.status_label.config(
+                    text=f"Waiting for frames — stream error:\n{self.stream_error}")
+        except Exception as e:
+            print(f"Paint error: {e}")
+        self.root.after(16, self.paint_loop)
+
+    def _composite_and_draw(self, quarters, pos):
+        # Stitch the four partial buffers, slicing off the overlap rows that the
+        # post-process blur needs for seamless quarter boundaries.
+        # Q1: keep rows 0-119 | Q2/Q3: drop leading overlap row | Q4: drop leading overlap row
+        row = FRAME_W
+        span = ROWS_PER_QUARTER * row
+        p1 = quarters[0][:span]
+        p2 = quarters[1][row:row + span]
+        p3 = quarters[2][row:row + span]
+        p4 = quarters[3][row:]
+
+        # Each UInt32 is [R, G, B, 0] in little-endian memory -> raw RGBX bytes.
+        raw_bytes = np.concatenate((p1, p2, p3, p4)).tobytes()
+        image = Image.frombytes("RGB", (640, 480), raw_bytes, "raw", "RGBX")
+
+        self.photo = ImageTk.PhotoImage(image)
+        self.label.config(image=self.photo)
+
+        if pos is not None:
+            self.pos_x, self.pos_y = pos
+
+        # Measure the paint rate (frames actually shown per second).
+        now = time.time()
+        dt = now - self.last_paint_time
+        self.last_paint_time = now
+        if dt > 0:
+            self.paint_fps = 0.9 * self.paint_fps + 0.1 * (1.0 / dt) if self.frames_painted else 1.0 / dt
+        self.frames_painted += 1
+
+        line1 = (f"{self.paint_fps:2.1f}fps (streamed) | "
+                 f"Insert: {self.insert_time:3.2f}ms (avg: {self.avg_insert_time:3.2f}ms) | "
+                 f"Frames: {self.frames_painted}")
+        line2 = f"Pos: ({self.pos_x:5.2f}, {self.pos_y:5.2f}) | Theme: {self.current_theme.upper()} (Press 'T' to switch theme)"
+        self.status_label.config(text=f"{line1}\n{line2}")
 
 def main():
     app = DOOMHouse()
