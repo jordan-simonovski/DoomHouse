@@ -35,6 +35,21 @@ On an 18-core machine this took the engine from **~8fps to ~30fps**. See the
 difference, and [docs/streaming.md](docs/streaming.md) for the full engineering log
 (including every silent failure mode of a two-week-old ClickHouse feature).
 
+## Demo
+
+Same engine, same ClickHouse, same hardware — only the render loop differs.
+
+**Original (non-streaming, ~6-8fps):**
+
+https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doomhouse_non-_streaming.mp4
+
+**This fork (streaming + concurrent render, ~30fps):**
+
+https://github.com/jordan-simonovski/DoomHouse/raw/main/screen_recording/doomhouse_streaming.mp4
+
+> If the players don't render inline, click through to
+> [`screen_recording/`](screen_recording/).
+
 ## Prerequisites
 
 - **[uv](https://docs.astral.sh/uv/)** for Python (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`)
