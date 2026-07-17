@@ -7,8 +7,8 @@
 -- =========================================================
 -- VIEW 1: QUARTER 1
 -- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.post_process_materialized_1
-TO doomhouse.rendered_frame_post_processed_1
+CREATE MATERIALIZED VIEW doomhouse_ns.post_process_materialized_1
+TO doomhouse_ns.rendered_frame_post_processed_1
 AS
 WITH
     640 AS w,
@@ -23,13 +23,13 @@ WITH
 SELECT
     pos_x, pos_y,
     arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
-FROM doomhouse.rendered_frame_1;
+FROM doomhouse_ns.rendered_frame_1;
 
 -- =========================================================
 -- VIEW 2: QUARTER 2
 -- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.post_process_materialized_2
-TO doomhouse.rendered_frame_post_processed_2
+CREATE MATERIALIZED VIEW doomhouse_ns.post_process_materialized_2
+TO doomhouse_ns.rendered_frame_post_processed_2
 AS
 WITH
     640 AS w,
@@ -44,13 +44,13 @@ WITH
 SELECT
     pos_x, pos_y,
     arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
-FROM doomhouse.rendered_frame_2;
+FROM doomhouse_ns.rendered_frame_2;
 
 -- =========================================================
 -- VIEW 3: QUARTER 3
 -- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.post_process_materialized_3
-TO doomhouse.rendered_frame_post_processed_3
+CREATE MATERIALIZED VIEW doomhouse_ns.post_process_materialized_3
+TO doomhouse_ns.rendered_frame_post_processed_3
 AS
 WITH
     640 AS w,
@@ -65,13 +65,13 @@ WITH
 SELECT
     pos_x, pos_y,
     arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
-FROM doomhouse.rendered_frame_3;
+FROM doomhouse_ns.rendered_frame_3;
 
 -- =========================================================
 -- VIEW 4: QUARTER 4
 -- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.post_process_materialized_4
-TO doomhouse.rendered_frame_post_processed_4
+CREATE MATERIALIZED VIEW doomhouse_ns.post_process_materialized_4
+TO doomhouse_ns.rendered_frame_post_processed_4
 AS
 WITH
     640 AS w,
@@ -86,4 +86,4 @@ WITH
 SELECT
     pos_x, pos_y,
     arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
-FROM doomhouse.rendered_frame_4;
+FROM doomhouse_ns.rendered_frame_4;

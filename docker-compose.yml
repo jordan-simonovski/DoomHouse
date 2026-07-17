@@ -1,0 +1,35 @@
+# Local ClickHouse for DOOMHouse.
+#
+#   docker compose up -d      # start ClickHouse
+#   python src/DOOMHouse.py   # run the game
+#   docker compose down       # stop it
+#
+# Streaming queries (SELECT ... STREAM) require ClickHouse 26.6 or later, so we
+# track the latest server image.
+#
+# CLICKHOUSE_SKIP_USER_SETUP=1 keeps the built-in passwordless `default` user
+# with network access. This is deliberate: the game's texture/map dictionaries
+# use SOURCE(CLICKHOUSE(...)) to read from tables in the same server, and that
+# self-connection authenticates as `default` with no password. Setting a
+# password would break dictionary loading. Fine for a local dev box; do not
+# expose this port to an untrusted network.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: doomhouse-clickhouse
+    # Bound to 127.0.0.1 only: the default user is passwordless (below), so the
+    # server must not be reachable from an untrusted LAN.
+    ports:
+      - "127.0.0.1:8123:8123"   # HTTP (used by clickhouse-connect)
+      - "127.0.0.1:9000:9000"   # native protocol
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

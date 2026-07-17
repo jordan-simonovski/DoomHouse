@@ -1,0 +1,19 @@
+[project]
+name = "doomhouse"
+version = "0.2.0"
+description = "A Doom-like 3D render engine in pure ClickHouse SQL, with streaming frame delivery"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "clickhouse-connect",  # database connector (uses raw_stream for STREAM queries)
+    "Pillow",              # image processing and texture loading
+    "python-dotenv",       # .env configuration
+    "numpy",               # fast parse of streamed pixel rows
+]
+
+[tool.uv]
+package = false
+# Always use uv's own managed CPython. Homebrew's python is frequently built
+# without Tk (_tkinter), which the game's Tkinter window needs; the managed
+# standalone builds bundle Tk, so this makes `uv run` work out of the box.
+python-preference = "only-managed"

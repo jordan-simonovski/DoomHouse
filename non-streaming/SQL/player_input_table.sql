@@ -1,4 +1,4 @@
-CREATE TABLE doomhouse.player_input
+CREATE TABLE doomhouse_ns.player_input
 (
     frame_id UInt64,
     old_x Float64,

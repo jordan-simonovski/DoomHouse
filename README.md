@@ -1,80 +1,64 @@
-# DOOMHouse
+# DOOMHouse — Streaming Edition
 
 <p align="center">
   <img src="images/splash.png" width="400" alt="Splash">
 </p>
 
-### DISCLAIMER 
-_**This repository is ~95% generated using Kilo Code with Gemini 3.0 Pro Preview, Gemini 3.0 Flash Preview, Opus 4.5 and ChatGPT 5.2.**_ 
+A Doom-style 3D engine whose entire renderer runs **inside ClickHouse** — and, in
+this fork, streams finished frames to the client with ClickHouse's new continuous
+queries (`SELECT ... STREAM`). The Python client only sends input and blits
+pixels; raycasting, texturing, shading, and the post-process blur are all SQL.
 
-### Blogpost:
-[DOOMHouse: 3D game render engine in pure ClickHouse SQL](https://therewillbedata.substack.com/p/doomhouse-3d-game-render-engine-in)
+> Forked from [arniwesth/DoomHouse](https://github.com/arniwesth/DoomHouse), which
+> established the pure-SQL raycasting engine. This fork rebuilds the render loop
+> around **ClickHouse streaming queries** and concurrent rendering. What that took
+> — and the surprises along the way — is written up in
+> [docs/streaming.md](docs/streaming.md).
 
-### Description
+## Why streaming?
 
-DOOMHouse is an experimental "Doom-like" 3D game rendering engine that offloads all the rendering logic entirely to a ClickHouse database. 
+The original engine used a request/response loop: insert an input, then block on
+`SELECT`s to pull the frame back. This fork instead treats each rendered frame as
+an event on a live stream:
 
-This project serves multiple purposes:
- - As a playground for exeprimenting with agentic coding, using frontier models to solve highly complex and non-trivial tasks.
- - As a proof-of-concept, demonstrating that modern analytical databases like ClickHouse are powerful enough to handle complex, non-traditional computational tasks — specifically real-time 3D graphics generation.
-- As a fun way to learn about and experiment with advanced ClickHouse concepts. 
+- **`SELECT ... STREAM` continuous queries** (ClickHouse 26.6+) tail the frame
+  tables and *push* each new frame to the client the moment it lands — no polling,
+  no per-frame query setup.
+- **Concurrent rendering.** The screen is split into four quarters, each rendered
+  by its own query dispatched in parallel, so rendering uses many cores instead of
+  one. This is the bulk of the speed-up.
+- **A `frame_id` barrier** keeps the four independently-streamed quarters coherent,
+  so frames never tear across the seam.
 
-The core graphics logic — including collision detection, raycasting, texture mapping, and shading — is executed via SQL queries, while a lightweight Python client handles user input and displays the resulting frames.
-
-### Screen recording
-[![DoomHouse](images/yt_thumbnail.jpeg)](https://youtu.be/us5Vp_spnP8)
-
-### Themes
-The engine supports different visual styles through SQL-based rendering logic. Examples:
-| Theme 1 | Theme 2 |
-|---------|---------|
-| <img src="images/theme1.png" width="400" alt="Theme 1"> | <img src="images/theme2.png" width="400" alt="Theme 2"> |
+On an 18-core machine this took the engine from **~8fps to ~30fps**. See the
+[side-by-side comparison](#side-by-side-non-streaming-vs-streaming) to feel the
+difference, and [docs/streaming.md](docs/streaming.md) for the full engineering log
+(including every silent failure mode of a two-week-old ClickHouse feature).
 
 ## Prerequisites
 
-- **Python 3.11 or later**
-- **ClickHouse Server 26.1.1.562 or later** (Local or Remote)
+- **[uv](https://docs.astral.sh/uv/)** for Python (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`)
+- **Docker** (for the bundled ClickHouse), or **ClickHouse Server 26.6+** reachable some other way
 
-## Installation
+Streaming queries (`SELECT ... STREAM` + `enable_streaming_queries`) require
+**ClickHouse 26.6 or later**.
 
-**OBS**: Due to an issue with some newer versions of ClickHouse this program only supports ClickHosue version `26.1.1.562` or later. 
+## Quickstart
 
-### 1. Install ClickHouse Server Locally
-
-If you don't have ClickHouse installed, you can run it easily using Docker or install it directly on your system.
-
-#### Using Docker (might be slower than native installation)
 ```bash
-docker run -d --name clickhouse-server -p 8123:8123 -p 9000:9000 --ulimit nofile=262144:262144 clickhouse/clickhouse-server
+docker compose up -d          # start ClickHouse 26.6+ (localhost only)
+uv run src/DOOMHouse.py        # uv installs deps on first run
 ```
 
-#### Native Installation (macOS/Linux)
-For macOS (using Homebrew):
-```bash
-brew install clickhouse
-brew services start clickhouse
-```
-For macOS or Linux:
-```bash
-curl https://clickhouse.com/ | sh
-./clickhouse server
-```
+`docker compose down` stops ClickHouse. The compose file runs the server with a
+passwordless `default` user bound to `127.0.0.1` — deliberate, because the game's
+texture/map dictionaries self-connect as `default` (see
+[docs/streaming.md](docs/streaming.md) for the why). Don't expose that port to an
+untrusted network.
 
-### 2. Install Python Dependencies
+### Configuration
 
-Install the required libraries using `pip`:
-```bash
-pip install -r requirements.txt
-```
-
-The project depends on:
-- `clickhouse-connect`: Database connector
-- `Pillow`: Image processing and texture loading
-- `python-dotenv`: Environment variable management
-
-## Configuration
-
-If you already have a ClickHouse server running or need to change the default connection settings, modify the `.env` file in the project root:
+Connection settings live in `.env` (defaults target the bundled ClickHouse):
 
 ```env
 CLICKHOUSE_HOST=localhost
@@ -82,15 +66,17 @@ CLICKHOUSE_PORT=8123
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASS=
 ```
-to the specifc connection settings needed to connect to the server.
 
-## Running the Application
+### Dependencies
 
-1. Ensure your ClickHouse server is running.
-2. Run the main Python script:
-   ```bash
-   python src/DOOMHouse.py
-   ```
+Managed by uv via `pyproject.toml` / `uv.lock` — `uv run` handles the virtualenv,
+so there's no separate install step (use `uv sync` to pre-install). The project
+uses:
+
+- `clickhouse-connect` — ClickHouse client (streaming via `raw_stream`)
+- `Pillow` — texture loading and image blitting
+- `numpy` — fast parsing of streamed pixel rows
+- `python-dotenv` — `.env` configuration
 
 ## Controls
 
@@ -103,10 +89,46 @@ to the specifc connection settings needed to connect to the server.
 | T     | Switch theme |
 | Esc | Exit |
 
+## Side-by-side: non-streaming vs streaming
+
+`non-streaming/` contains the original request/response engine, wired to the *same*
+ClickHouse (a separate `doomhouse_ns` database, so both can run at once). Run them
+together to compare frame rates on your hardware:
+
+```bash
+docker compose up -d
+uv run non-streaming/DOOMHouse.py   # original polling + materialized-view engine
+uv run src/DOOMHouse.py             # this fork: streaming + concurrent render
+```
+
+See [non-streaming/README.md](non-streaming/README.md) for details.
+
+## End-to-end test (headless)
+
+Exercises the full streaming pipeline without opening a window:
+
+```bash
+docker compose up -d
+uv run test_e2e.py
+```
+
+## Screen recording
+
+[![DoomHouse](images/yt_thumbnail.jpeg)](https://youtu.be/us5Vp_spnP8)
+
+## Themes
+
+| Theme 1 | Theme 2 |
+|---------|---------|
+| <img src="images/theme1.png" width="400" alt="Theme 1"> | <img src="images/theme2.png" width="400" alt="Theme 2"> |
+
 ## Acknowledgments
 
-This project is amongst other inspired by:
+- **[arniwesth/DoomHouse](https://github.com/arniwesth/DoomHouse)** — the original
+  pure-SQL DoomHouse engine this fork is built on.
+
+Also inspired by:
 - [DoomQL: Rendering Doom in a Database](https://cedardb.com/blog/doomql/)
 - [DuckDB-Doom: Rendering Doom in DuckDB](https://www.hey.earth/posts/duckdb-doom)
-- [Announcing adsb.exposed - Interactive Visualization and Analytics on ADS-B Flight Data with ClickHouse](https://clickhouse.com/blog/interactive-visualization-analytics-adsb-flight-data-with-clickhouse)
+- [Interactive Visualization and Analytics on ADS-B Flight Data with ClickHouse](https://clickhouse.com/blog/interactive-visualization-analytics-adsb-flight-data-with-clickhouse)
 - [Writing a retro 3D FPS engine from scratch](https://medium.com/@btco_code/writing-a-retro-3d-fps-engine-from-scratch-b2a9723e6b06)

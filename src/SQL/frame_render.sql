@@ -63,12 +63,38 @@
    ========================================================================================
 */
 
--- =========================================================
--- VIEW 1: QUARTER 1 (Rows 0-119)
--- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.render_materialized_1
-TO doomhouse.rendered_frame_1
-AS
+-- ============================================================================
+--  Per-quarter render + blur QUERY TEMPLATES (not views).
+--
+--  The client fills the @@...@@ placeholders with the current player input and
+--  dispatches the four quarters as concurrent INSERT...SELECTs into the streamed
+--  bus tables. Inlining the input as literals avoids a per-frame insert into a
+--  player_input table -- that insert, surprisingly, was the bottleneck (~100ms+
+--  for four concurrent Memory inserts). With it gone, four concurrent renders
+--  run in ~20ms (~50fps ceiling). See docs/streaming.md.
+--
+--  Quarters are delimited by lines starting with '-- QUARTER'. Each template
+--  SELECTs (frame_id, pos_x, pos_y, image_data); frame_id lets the client
+--  composite only frame-aligned quarters (tearing barrier).
+-- ============================================================================
+
+-- QUARTER 1
+SELECT @@frame_id@@ AS frame_id, pos_x, pos_y, image_data
+FROM (
+WITH
+    640 AS w,
+    image_data AS src,
+    length(src) AS len,
+    arraySlice(arrayConcat([0], src), 1, len) AS l,
+    arrayResize(arraySlice(src, 2), len, 0) AS r,
+    arraySlice(arrayConcat(arrayWithConstant(w, 0), src), 1, len) AS u,
+    arrayResize(arraySlice(src, w + 1), len, 0) AS d,
+    0x00FF00FF AS mask_rb,
+    0x0000FF00 AS mask_g
+SELECT
+    pos_x, pos_y,
+    arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
+FROM (
 WITH 
     640 AS W,
     480 AS H,
@@ -137,7 +163,7 @@ FROM (
                                     valid_x_inter as valid_x
                                 FROM (
                                     SELECT *, if(dictGet('doomhouse.dict_map_data', 'val', toUInt32(floor(old_y) * MAP_W + floor(try_x + if(try_x > old_x, 0.2, -0.2)) + 1)) = 0, try_x, old_x) as valid_x_inter
-                                    FROM doomhouse.player_input
+                                    FROM (SELECT @@frame_id@@ AS frame_id, @@old_x@@ AS old_x, @@old_y@@ AS old_y, @@try_x@@ AS try_x, @@try_y@@ AS try_y, @@dir_x@@ AS dir_x, @@dir_y@@ AS dir_y, @@plane_x@@ AS plane_x, @@plane_y@@ AS plane_y)
                                 ) AS pi
                             ) AS p
                             CROSS JOIN numbers(W) AS screen_col
@@ -151,14 +177,27 @@ FROM (
             FROM numbers(H_QUARTER + 1)
         ) AS v_lines
     ) AS sub
-);
+)
+)
+)
 
--- =========================================================
--- VIEW 2: QUARTER 2 (Rows 120-239)
--- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.render_materialized_2
-TO doomhouse.rendered_frame_2
-AS
+-- QUARTER 2
+SELECT @@frame_id@@ AS frame_id, pos_x, pos_y, image_data
+FROM (
+WITH
+    640 AS w,
+    image_data AS src,
+    length(src) AS len,
+    arraySlice(arrayConcat([0], src), 1, len) AS l,
+    arrayResize(arraySlice(src, 2), len, 0) AS r,
+    arraySlice(arrayConcat(arrayWithConstant(w, 0), src), 1, len) AS u,
+    arrayResize(arraySlice(src, w + 1), len, 0) AS d,
+    0x00FF00FF AS mask_rb,
+    0x0000FF00 AS mask_g
+SELECT
+    pos_x, pos_y,
+    arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
+FROM (
 WITH 
     640 AS W,
     480 AS H,
@@ -227,7 +266,7 @@ FROM (
                                     valid_x_inter as valid_x
                                 FROM (
                                     SELECT *, if(dictGet('doomhouse.dict_map_data', 'val', toUInt32(floor(old_y) * MAP_W + floor(try_x + if(try_x > old_x, 0.2, -0.2)) + 1)) = 0, try_x, old_x) as valid_x_inter
-                                    FROM doomhouse.player_input
+                                    FROM (SELECT @@frame_id@@ AS frame_id, @@old_x@@ AS old_x, @@old_y@@ AS old_y, @@try_x@@ AS try_x, @@try_y@@ AS try_y, @@dir_x@@ AS dir_x, @@dir_y@@ AS dir_y, @@plane_x@@ AS plane_x, @@plane_y@@ AS plane_y)
                                 ) AS pi
                             ) AS p
                             CROSS JOIN numbers(W) AS screen_col
@@ -241,14 +280,27 @@ FROM (
             FROM numbers(H_QUARTER + 2)
         ) AS v_lines
     ) AS sub
-);
+)
+)
+)
 
--- =========================================================
--- VIEW 3: QUARTER 3 (Rows 240-359)
--- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.render_materialized_3
-TO doomhouse.rendered_frame_3
-AS
+-- QUARTER 3
+SELECT @@frame_id@@ AS frame_id, pos_x, pos_y, image_data
+FROM (
+WITH
+    640 AS w,
+    image_data AS src,
+    length(src) AS len,
+    arraySlice(arrayConcat([0], src), 1, len) AS l,
+    arrayResize(arraySlice(src, 2), len, 0) AS r,
+    arraySlice(arrayConcat(arrayWithConstant(w, 0), src), 1, len) AS u,
+    arrayResize(arraySlice(src, w + 1), len, 0) AS d,
+    0x00FF00FF AS mask_rb,
+    0x0000FF00 AS mask_g
+SELECT
+    pos_x, pos_y,
+    arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
+FROM (
 WITH 
     640 AS W,
     480 AS H,
@@ -317,7 +369,7 @@ FROM (
                                     valid_x_inter as valid_x
                                 FROM (
                                     SELECT *, if(dictGet('doomhouse.dict_map_data', 'val', toUInt32(floor(old_y) * MAP_W + floor(try_x + if(try_x > old_x, 0.2, -0.2)) + 1)) = 0, try_x, old_x) as valid_x_inter
-                                    FROM doomhouse.player_input
+                                    FROM (SELECT @@frame_id@@ AS frame_id, @@old_x@@ AS old_x, @@old_y@@ AS old_y, @@try_x@@ AS try_x, @@try_y@@ AS try_y, @@dir_x@@ AS dir_x, @@dir_y@@ AS dir_y, @@plane_x@@ AS plane_x, @@plane_y@@ AS plane_y)
                                 ) AS pi
                             ) AS p
                             CROSS JOIN numbers(W) AS screen_col
@@ -331,14 +383,27 @@ FROM (
             FROM numbers(H_QUARTER + 2)
         ) AS v_lines
     ) AS sub
-);
+)
+)
+)
 
--- =========================================================
--- VIEW 4: QUARTER 4 (Rows 360-479)
--- =========================================================
-CREATE MATERIALIZED VIEW doomhouse.render_materialized_4
-TO doomhouse.rendered_frame_4
-AS
+-- QUARTER 4
+SELECT @@frame_id@@ AS frame_id, pos_x, pos_y, image_data
+FROM (
+WITH
+    640 AS w,
+    image_data AS src,
+    length(src) AS len,
+    arraySlice(arrayConcat([0], src), 1, len) AS l,
+    arrayResize(arraySlice(src, 2), len, 0) AS r,
+    arraySlice(arrayConcat(arrayWithConstant(w, 0), src), 1, len) AS u,
+    arrayResize(arraySlice(src, w + 1), len, 0) AS d,
+    0x00FF00FF AS mask_rb,
+    0x0000FF00 AS mask_g
+SELECT
+    pos_x, pos_y,
+    arrayMap((c, l, r, u, d) -> bitOr(bitAnd(bitShiftRight((bitAnd(c, mask_rb) * 4) + bitAnd(l, mask_rb) + bitAnd(r, mask_rb) + bitAnd(u, mask_rb) + bitAnd(d, mask_rb), 3), mask_rb), bitAnd(bitShiftRight((bitAnd(c, mask_g) * 4) + bitAnd(l, mask_g) + bitAnd(r, mask_g) + bitAnd(u, mask_g) + bitAnd(d, mask_g), 3), mask_g)), src, l, r, u, d) AS image_data
+FROM (
 WITH 
     640 AS W,
     480 AS H,
@@ -407,7 +472,7 @@ FROM (
                                     valid_x_inter as valid_x
                                 FROM (
                                     SELECT *, if(dictGet('doomhouse.dict_map_data', 'val', toUInt32(floor(old_y) * MAP_W + floor(try_x + if(try_x > old_x, 0.2, -0.2)) + 1)) = 0, try_x, old_x) as valid_x_inter
-                                    FROM doomhouse.player_input
+                                    FROM (SELECT @@frame_id@@ AS frame_id, @@old_x@@ AS old_x, @@old_y@@ AS old_y, @@try_x@@ AS try_x, @@try_y@@ AS try_y, @@dir_x@@ AS dir_x, @@dir_y@@ AS dir_y, @@plane_x@@ AS plane_x, @@plane_y@@ AS plane_y)
                                 ) AS pi
                             ) AS p
                             CROSS JOIN numbers(W) AS screen_col
@@ -421,4 +486,6 @@ FROM (
             FROM numbers(H_QUARTER + 1)
         ) AS v_lines
     ) AS sub
-);
+)
+)
+)
